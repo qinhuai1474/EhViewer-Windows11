@@ -1,0 +1,44 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+# Bundled release installers
+release
+
+# Rust / Tauri build artifacts
+src-tauri/target
+src-tauri/gen
+
+# Internal dev handoff doc (kept local, not published)
+docs/skill-handoff.md
+
+# Defense-in-depth: never track runtime/local sensitive artifacts
+*.db
+*.sqlite
+*.sqlite3
+settings.json
+*.pem
+*.pfx
+*.p12
+*.key
+.env

@@ -1,0 +1,96 @@
+.ggrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 14px;
+}
+
+.gcard {
+  display: flex;
+  flex-direction: column;
+  text-align: left;
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 0;
+  overflow: hidden;
+  cursor: pointer;
+  color: inherit;
+  transition: transform 0.12s ease, border-color 0.12s ease;
+}
+
+.gcard:hover {
+  transform: translateY(-2px);
+  border-color: var(--color-accent);
+}
+
+.gcard-thumb {
+  position: relative;
+  aspect-ratio: 3 / 4;
+  background: #101215;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.gcard-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.gcard-thumb-placeholder {
+  width: 100%;
+  height: 100%;
+}
+
+.gcard-pages {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 8px;
+}
+
+.gcard-body {
+  padding: 8px 10px 10px;
+}
+
+.gcard-cat {
+  display: inline-block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  background: #333;
+  color: #cfd3da;
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-bottom: 5px;
+}
+
+.gcard-title {
+  margin: 0 0 6px;
+  font-size: 13px;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: var(--color-text);
+}
+
+.gcard-meta {
+  display: flex;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--color-text-dim);
+}
+
+.gcard-posted {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--color-text-dim);
+}

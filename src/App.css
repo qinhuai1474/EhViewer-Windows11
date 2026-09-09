@@ -1,0 +1,60 @@
+:root {
+  --color-bg: #1b1d22;
+  --color-bg-sidebar: #16181c;
+  --color-bg-card: #23262c;
+  --color-border: #30343b;
+  --color-text: #e7e9ed;
+  --color-text-dim: #9aa1ac;
+  --color-accent: #5b8def;
+  --color-hover: #2b2f36;
+  color-scheme: dark;
+}
+
+html, body, #root {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+  background: var(--color-bg);
+  color: var(--color-text);
+  -webkit-font-smoothing: antialiased;
+}
+
+.app {
+  display: flex;
+  height: 100vh;
+}
+
+.content {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+}
+
+.page {
+  padding: 20px 24px;
+}
+
+.page-title {
+  margin: 0 0 8px;
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.page-hint {
+  margin: 0;
+  color: var(--color-text-dim);
+}
+
+.back {
+  padding: 6px 14px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-card);
+  color: var(--color-text);
+  border-radius: 6px;
+  cursor: pointer;
+  margin-bottom: 12px;
+}
+
