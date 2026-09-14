@@ -175,3 +175,211 @@
   font-size: 12px;
   color: var(--color-text-dim);
 }
+
+/* ---- Batch selection ---- */
+.dl-check {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+}
+
+.dl-check input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--color-accent);
+  cursor: pointer;
+}
+
+.dl-row.selected {
+  border-color: var(--color-accent);
+  box-shadow: inset 0 0 0 1px var(--color-accent);
+}
+
+.dl-batchbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: rgba(91, 141, 239, 0.12);
+  border: 1px solid rgba(91, 141, 239, 0.4);
+  border-radius: 10px;
+}
+
+.dl-batch-count {
+  margin-right: auto;
+  font-size: 13px;
+  color: var(--color-accent);
+}
+
+.dl-batchbar button,
+.dl-modal-new button,
+.dl-modal-close {
+  padding: 5px 12px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg);
+  color: var(--color-text);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.dl-batchbar button.primary {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: #fff;
+}
+
+.dl-batchbar button.danger,
+.dl-row-actions button.danger {
+  background: rgba(226, 94, 94, 0.16);
+  border-color: rgba(226, 94, 94, 0.5);
+  color: #e25e5e;
+}
+
+.dl-batchbar button.ghost {
+  background: transparent;
+}
+
+.dl-batchbar button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ---- Relabel modal ---- */
+.dl-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 1000;
+}
+
+.dl-modal {
+  width: 360px;
+  max-width: calc(100vw - 40px);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+
+.dl-modal-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.dl-modal-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.dl-modal-label {
+  padding: 6px 14px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg);
+  color: var(--color-text);
+  border-radius: 16px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.dl-modal-label.active {
+  border-color: var(--color-accent);
+  background: rgba(91, 141, 239, 0.16);
+  color: var(--color-accent);
+}
+
+.dl-modal-new {
+  display: flex;
+  gap: 8px;
+}
+
+.dl-modal-input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg);
+  color: var(--color-text);
+  outline: none;
+}
+
+.dl-modal-input:focus {
+  border-color: var(--color-accent);
+}
+
+.dl-modal-new button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.dl-modal-close {
+  align-self: flex-end;
+}
+
+/* ---- Delete confirm modal ---- */
+.dl-delete-hint {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-text-dim);
+}
+
+.dl-delete-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 2px;
+}
+
+.dl-delete-erase {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--color-text);
+  cursor: pointer;
+  user-select: none;
+}
+
+.dl-delete-erase input {
+  accent-color: var(--color-accent);
+}
+
+.dl-delete-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.dl-delete-actions button {
+  padding: 5px 14px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg);
+  color: var(--color-text);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.dl-delete-actions button.danger {
+  background: rgba(226, 94, 94, 0.16);
+  border-color: rgba(226, 94, 94, 0.5);
+  color: #e25e5e;
+}
+
+.dl-delete-actions button.danger:hover {
+  background: rgba(226, 94, 94, 0.28);
+  border-color: rgba(226, 94, 94, 0.7);
+}
