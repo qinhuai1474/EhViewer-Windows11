@@ -9,7 +9,10 @@ pub mod settings;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{Emitter, Manager};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
 
 use db::Db;
 use download::DownloadManager;
@@ -19,6 +22,7 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub settings_path: PathBuf,
     pub settings: Arc<std::sync::Mutex<settings::Settings>>,
+    pub quit: Arc<AtomicBool>,
 }
 
 /// Returns app metadata for the frontend.
@@ -396,6 +400,7 @@ fn set_setting_field(s: &mut settings::Settings, key: &str, value: &serde_json::
         "custom_host" => s.custom_host = some_str,
         "doh_url" => s.doh_url = str_v.unwrap_or_else(|| s.doh_url.clone()),
         "use_builtin_hosts" => s.use_builtin_hosts = value.as_bool().unwrap_or(true),
+        "close_to_tray" => s.close_to_tray = value.as_bool().unwrap_or(true),
         _ => return Err(format!("未知设置项: {key}")),
     }
     Ok(())
@@ -441,6 +446,15 @@ fn state_from_json(v: Option<&serde_json::Value>) -> i32 {
 pub fn run() {
     ehimg::register(tauri::Builder::default())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // A second launch of the exe focuses the already-running main window
+            // instead of spawning a new process.
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .setup(|app| {
             let config_dir = app.path().app_config_dir().unwrap_or_else(|_| {
                 // Never depend on a developer-local path: key off the per-user
@@ -481,12 +495,58 @@ pub fn run() {
             let manager_clone = manager.clone();
             manager_clone.start();
 
+            let quit = Arc::new(AtomicBool::new(false));
             app.manage(AppState {
                 db,
                 settings_path,
                 settings,
+                quit: quit.clone(),
             });
             app.manage(manager);
+
+            // System tray: keep the process alive for background downloads when
+            // the window is closed (handled by the CloseRequested hook below).
+            let show_item = MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let tray_quit = quit.clone();
+            let _tray = TrayIconBuilder::with_id("main-tray")
+                .icon(app.default_window_icon().cloned().ok_or("no window icon")?)
+                .menu(&menu)
+                .tooltip("EhViewer - download running in background (click to restore)")
+                .show_menu_on_left_click(true)
+                .on_menu_event(move |app_handle, event| match event.id.as_ref() {
+                    "show" => {
+                        if let Some(w) = app_handle.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.unminimize();
+                            let _ = w.set_focus();
+                        }
+                    }
+                    "quit" => {
+                        tray_quit.store(true, Ordering::SeqCst);
+                        app_handle.exit(0);
+                    }
+                    _ => {}
+                })
+                .build(app)?;
+
+            if let Some(window) = app.get_webview_window("main") {
+                let win = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        let state = win.state::<AppState>();
+                        let hide = state.settings.lock().unwrap().close_to_tray;
+                        let quitting = state.quit.load(Ordering::SeqCst);
+                        if hide && !quitting {
+                            api.prevent_close();
+                            let _ = win.hide();
+                            let _ = win.emit("tray-hidden", ());
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

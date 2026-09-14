@@ -68,6 +68,8 @@ pub struct Settings {
     pub doh_url: String,
     /// Prefer the bundled E-Hentai IP table before DoH resolution.
     pub use_builtin_hosts: bool,
+    /// Close the main window to the system tray instead of quitting.
+    pub close_to_tray: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +104,7 @@ impl Default for Settings {
             custom_host: None,
             doh_url: String::new(),
             use_builtin_hosts: true,
+            close_to_tray: true,
         }
     }
 }
@@ -174,6 +177,12 @@ pub fn decrypt_cookie_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_to_tray_defaults_to_enabled() {
+        let s = Settings::default();
+        assert!(s.close_to_tray, "closing to tray should default to on");
+    }
 
     #[test]
     fn cookie_encrypt_decrypt_roundtrip() {

@@ -100,4 +100,5 @@ export interface AppSettings {
   custom_host: string | null;
   doh_url: string;
   use_builtin_hosts: boolean;
+  close_to_tray: boolean;
 }

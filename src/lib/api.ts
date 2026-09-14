@@ -249,5 +249,6 @@ export function fixtureSettings(): AppSettings {
     custom_host: null,
     doh_url: "",
     use_builtin_hosts: true,
+    close_to_tray: true,
   };
 }

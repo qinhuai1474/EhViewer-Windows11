@@ -229,6 +229,7 @@ export function SettingsPage() {
           <NumberSetting label="列表每页条数" value={s.download_list_page_size} onChange={(v) => apply("download_list_page_size", Math.max(1, v))} />
           <SwitchSetting label="始终下载原图" checked={s.download_always_original} onChange={(v) => apply("download_always_original", v)} />
           <NumberSetting label="下载间隔（秒）" value={s.download_interval_secs} onChange={(v) => apply("download_interval_secs", Math.max(0, v))} />
+          <SwitchSetting label="关闭主界面时最小化到托盘（后台下载）" checked={s.close_to_tray} onChange={(v) => apply("close_to_tray", v)} />
         </div>
       </Section>
 
