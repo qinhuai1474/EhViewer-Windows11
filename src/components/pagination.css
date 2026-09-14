@@ -34,18 +34,3 @@
   min-width: 70px;
   text-align: center;
 }
-
-.pagination-jump {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.pagination-jump-form input {
-  width: 58px;
-  padding: 4px 6px;
-  background: var(--color-bg-card);
-  color: var(--color-text);
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-}

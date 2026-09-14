@@ -94,3 +94,54 @@
   font-size: 11px;
   color: var(--color-text-dim);
 }
+
+/* Quick-download button (top-right of the thumbnail). */
+.gcard-dl {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease, background 0.12s ease;
+}
+
+.gcard:hover .gcard-dl,
+.gcard-dl--done,
+.gcard-dl--queued,
+.gcard-dl--error {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.gcard-dl:hover {
+  background: var(--color-accent);
+}
+
+.gcard-dl--text {
+  width: auto;
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 12px;
+}
+
+.gcard-dl--done {
+  background: #2e7d32;
+}
+
+.gcard-dl--error {
+  background: #c62828;
+}
+.gcard-dl--queued {
+  background: var(--color-accent);
+}
