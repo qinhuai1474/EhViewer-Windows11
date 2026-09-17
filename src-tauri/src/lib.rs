@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{Emitter, Manager};
+use tauri::ipc::Channel;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 
@@ -152,6 +153,28 @@ async fn fetch_image(url: String) -> Result<String, String> {
     ehimg::data_url(&url).await
 }
 
+/// Per-image download progress emitted while `fetch_image_progress` streams the
+/// body. `total == 0` means the server did not send a Content-Length.
+#[derive(Clone, serde::Serialize)]
+struct ImageProgress {
+    received: u64,
+    total: u64,
+}
+
+/// Like `fetch_image` but streams progress events on `on_event` while the image
+/// downloads. Percent = `received / total` when `total > 0`; consumes the same
+/// disk cache, so hot images resolve instantly without intermediate events.
+#[tauri::command]
+async fn fetch_image_progress(
+    url: String,
+    on_event: Channel<ImageProgress>,
+) -> Result<String, String> {
+    ehimg::data_url_progress(&url, |received, total| {
+        let _ = on_event.send(ImageProgress { received, total });
+    })
+    .await
+}
+
 // ----- download commands -----
 
 /// Creates (or resumes) a download for a gallery.
@@ -187,7 +210,7 @@ async fn download_delete(app: tauri::AppHandle, gid: u64, erase: bool) -> Result
 #[tauri::command]
 async fn download_relabel(app: tauri::AppHandle, gid: u64, label: String) -> Result<(), String> {
     let m = app.state::<Arc<DownloadManager>>();
-    m.relabel_download(gid, &label)
+    m.relabel_download(gid, &label).await
 }
 
 /// Returns the full download list.
@@ -398,6 +421,7 @@ fn set_setting_field(s: &mut settings::Settings, key: &str, value: &serde_json::
         "max_retries" => s.max_retries = value.as_u64().unwrap_or(3) as u32,
         "image_cache_size_mb" => s.image_cache_size_mb = value.as_u64().unwrap_or(100) as u32,
         "custom_host" => s.custom_host = some_str,
+        "image_host_allowlist" => s.image_host_allowlist = str_v.unwrap_or_default(),
         "doh_url" => s.doh_url = str_v.unwrap_or_else(|| s.doh_url.clone()),
         "use_builtin_hosts" => s.use_builtin_hosts = value.as_bool().unwrap_or(true),
         "close_to_tray" => s.close_to_tray = value.as_bool().unwrap_or(true),
@@ -470,6 +494,10 @@ pub fn run() {
             let settings_path = settings::Settings::default_path(&config_dir);
             let settings = settings::Settings::load(&settings_path).unwrap_or_default();
             client::engine::apply_settings(&settings);
+            // Enable the live-resolver path from cold start so EH hosts ship with
+            // fresh DoH + reachability-ordered pins instead of waiting for a
+            // transient failure to escalate (aligns with SXJ's self-healing).
+            client::dns::set_allow_network_resolve(true);
             apply_tag_settings(&settings);
             let db_path = config_dir.join("ehviewer.db");
             let db = Db::open(&db_path).map_err(|e| {
@@ -558,6 +586,7 @@ pub fn run() {
             get_gallery_metadata,
             resolve_showpage,
             fetch_image,
+            fetch_image_progress,
             build_list_url,
             save_reading_progress,
             get_reading_progress,
@@ -650,5 +679,3 @@ mod tests {
         assert_eq!(state_from_json(None), 0);
     }
 }
-
-

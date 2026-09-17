@@ -44,6 +44,7 @@ pub fn apply_settings(s: &crate::settings::Settings) {
     );
     url::set_host_override(s.custom_host.clone());
     dns::apply_hosts_text(&s.hosts_override);
+    url::set_image_host_allowlist(&s.image_host_allowlist);
 }
 /// Refreshes the uconfig cookie on the client from the current settings.
 pub fn apply_uconfig() {
@@ -72,6 +73,7 @@ pub async fn get_gallery_list(url: &str) -> EhResult<GalleryListResult> {
         }
         item.thumb = apply_thumb(item.thumb.take());
     }
+    url::add_trusted_image_urls(result.items.iter().map(|i| i.thumb.clone()).flatten());
     result.requested_url = Some(url.to_string());
     Ok(result)
 }
@@ -108,6 +110,9 @@ pub async fn get_gallery_detail(
         }
     }
     detail.thumb = apply_thumb(detail.thumb.take());
+    if let Some(t) = &detail.thumb {
+        url::add_trusted_image_urls([t.clone()]);
+    }
     Ok(detail)
 }
 
@@ -125,6 +130,7 @@ pub async fn get_preview_set(
     for p in set.iter_mut() {
         p.image_url = super::thumb::apply(&p.image_url);
     }
+    url::add_trusted_image_urls(set.iter().map(|p| p.image_url.clone()));
     Ok(set)
 }
 
@@ -146,7 +152,14 @@ pub async fn get_online_page(
     };
     let u = url::gallery_page_url(site, gid, index, &p_token);
     let body = client::get_text(&u, Some(&url::gallery_detail_url(site, gid, token, 0, false))).await?;
-    gallery_page::parse(&body, gid, index)
+    let page = gallery_page::parse(&body, gid, index)?;
+    // Trust the reader image host so `fetch_image` can load it even when it is
+    // not part of the fixed site family (reader origin is often a tokenized host).
+    url::add_trusted_image_urls([page.image_url.clone()]);
+    if let Some(o) = &page.origin_image_url {
+        url::add_trusted_image_urls([o.clone()]);
+    }
+    Ok(page)
 }
 
 /// Preview page index that covers gallery page `index`. `per_page` is the number

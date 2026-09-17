@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, COOKIE, ORIGIN, REFERER};
 
 use super::dns;
@@ -100,9 +101,11 @@ fn build_headers(url: &str, referer: &str) -> HeaderMap {
         reqwest::header::HeaderName::from_static("sec-fetch-mode"),
         HeaderValue::from_static("navigate"),
     );
-    // Never forward session cookies / Referer to a host outside the allowed EH
-    // site family (the two sites + CDN or the configured custom host override).
-    if super::url::is_allowed_url(url) {
+    // Cookies + Referer travel only to the EH site family/CDN; a dynamically
+    // trusted image host (parsed from a reader/preview page) gets the EH Referer
+    // but never our session cookies.
+    let host = super::url::url_host(url).unwrap_or_default();
+    if super::url::is_eh_host(&host) {
         if !referer.is_empty() {
             h.insert(REFERER, HeaderValue::from_str(referer).unwrap());
             h.insert(ORIGIN, HeaderValue::from_str(referer).unwrap());
@@ -110,6 +113,11 @@ fn build_headers(url: &str, referer: &str) -> HeaderMap {
         let cookie = extra_cookie_header();
         if !cookie.is_empty() {
             h.insert(COOKIE, cookie);
+        }
+    } else if super::url::is_trusted_image_host(&host) {
+        if !referer.is_empty() {
+            h.insert(REFERER, HeaderValue::from_str(referer).unwrap());
+            h.insert(ORIGIN, HeaderValue::from_str(referer).unwrap());
         }
     }
     h
@@ -219,12 +227,31 @@ async fn build_client() -> reqwest::Result<reqwest::Client> {
         },
         _ => builder = builder.no_proxy(),
     }
-    // Only pin EH hosts to resolved IPs after a transient failure (escalated
-    // resolution); otherwise use the plain system DNS to avoid stale-pin issues.
+    // Pin EH hosts to resolved IPs (SNI stays intact). The live path resolves all
+    // pinned hosts concurrently (each DoH lookup is bounded) and, for a direct
+    // connection, quick-probes candidates so a currently-reachable anycast IP is
+    // pinned first - mirroring OkHttp advancing through a request's addresses so a
+    // dead edge does not burn a connect_timeout. Proxied connections skip the probe
+    // because the proxy itself decides reachability.
     if dns::should_pin() {
-        for host in dns::pinned_hosts() {
-            let ips = dns::resolve(&host).await;
-            for ip in ips {
+        let hosts = dns::pinned_hosts();
+        let mut resolved: std::collections::HashMap<String, Vec<std::net::IpAddr>> =
+            std::collections::HashMap::new();
+        {
+            let mut set = tokio::task::JoinSet::new();
+            for host in hosts {
+                let h = host.clone();
+                set.spawn(async move { (h, dns::resolve(&host).await) });
+            }
+            while let Some(out) = set.join_next().await {
+                if let Ok((h, ips)) = out {
+                    resolved.insert(h, ips);
+                }
+            }
+        }
+        for (host, ips) in resolved {
+            let ordered = if pty == 0 { dns::probe_order(ips).await } else { ips };
+            for ip in ordered {
                 if ip.is_unspecified() {
                     continue;
                 }
@@ -338,6 +365,28 @@ async fn get_text_once(url: &str, referer: Option<&str>) -> EhResult<String> {
     Ok(body)
 }
 
+/// Resolves-and-pins the host of a dynamically trusted image URL (reader origin
+/// / thumbnails not in the builtin table) via the DoH/custom DNS layer, so the
+/// fetch does not fall through to a possibly-poisoned system resolver. No-op for
+/// the EH site family (already pinned) and for untrusted hosts.
+pub async fn ensure_image_host(url: &str) {
+    let Some(host) = super::url::url_host(url) else {
+        return;
+    };
+    if super::url::is_eh_host(&host) || !super::url::is_trusted_image_host(&host) {
+        return;
+    }
+    if dns::is_pinned(&host) {
+        return;
+    }
+    let ips = dns::resolve(&host).await;
+    if ips.is_empty() {
+        return;
+    }
+    dns::set_image_host_ips(&host, &ips);
+    invalidate_client();
+}
+
 /// GET binary bytes (used for images / downloads). Mirrors `get_text`: transient
 /// network failures (Cloudflare resets, etc.) are retried so a single hiccup
 /// doesn't break thumbnails/images.
@@ -371,6 +420,64 @@ async fn get_bytes_once(url: &str, referer: Option<&str>) -> EhResult<Vec<u8>> {
         .await
         .map_err(|e| EhError::Network(e.to_string()))?;
     Ok(bytes.to_vec())
+}
+
+/// Like [`get_bytes`] but invokes `on_progress(received, total)` periodically
+/// while the body streams in. `total` is the Content-Length when the server
+/// provides one, otherwise `0` (callers should treat `total == 0` as "unknown").
+/// This mirrors SXJ's reader page progress (`receivedSize / contentLength`).
+pub async fn get_bytes_with_progress<F>(
+    url: &str,
+    referer: Option<&str>,
+    mut on_progress: F,
+) -> EhResult<Vec<u8>>
+where
+    F: FnMut(u64, u64),
+{
+    let max = max_retries();
+    let mut attempt = 0u32;
+    loop {
+        match get_bytes_once_with_progress(url, referer, &mut on_progress).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) if e.is_transient() && attempt < max => {
+                attempt += 1;
+                tokio::time::sleep(backoff_delay(attempt as u64)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+async fn get_bytes_once_with_progress<F>(
+    url: &str,
+    referer: Option<&str>,
+    on_progress: &mut F,
+) -> EhResult<Vec<u8>>
+where
+    F: FnMut(u64, u64),
+{
+    let headers = build_headers(url, referer.map(str::to_owned).unwrap_or_else(default_referer).as_str());
+    let resp = client().await
+        .get(url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|e| EhError::Network(e.to_string()))?;
+    let status = resp.status();
+    check_status(status)?;
+    let total = resp.content_length().unwrap_or(0);
+    let mut received = 0u64;
+    let mut bytes = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| EhError::Network(e.to_string()))?;
+        received += chunk.len() as u64;
+        bytes.extend_from_slice(&chunk);
+        if total > 0 {
+            on_progress(received, total);
+        }
+    }
+    Ok(bytes)
 }
 
 /// POST a JSON body (e.g. `api.php` gdata/showpage) to `url` and return text.

@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 
 pub const SPIDER_INFO_FILENAME: &str = ".ehviewer";
 
+/// Folder name used when a download has no label yet (mirrors the frontend's
+/// `DEFAULT_LABEL`), so every gallery still nests under a label sub-folder.
+pub const DEFAULT_LABEL_DIR: &str = "默认";
+
 /// Extensions recognised when scanning for already-downloaded pages.
 pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp"];
 
@@ -31,6 +35,23 @@ pub fn sanitize_filename(name: &str) -> String {
 /// Gallery download folder name: `<gid>-<sanitized title>`.
 pub fn gallery_dir_name(gid: u64, title: &str) -> String {
     format!("{}-{}", gid, sanitize_filename(title))
+}
+
+/// Label sub-folder name: sanitized label, falling back to `DEFAULT_LABEL_DIR`
+/// when the label is empty so the download is grouped under the default folder.
+pub fn label_dir_name(label: &str) -> String {
+    if label.trim().is_empty() {
+        DEFAULT_LABEL_DIR.to_string()
+    } else {
+        sanitize_filename(label)
+    }
+}
+
+/// Full download folder for a gallery under its label sub-folder:
+/// `<root>/<label>/<gid>-<sanitized title>`. Single entry point used by
+/// downloads, deletion, migration and relabelling.
+pub fn gallery_download_path(root: &Path, label: &str, gid: u64, title: &str) -> PathBuf {
+    root.join(label_dir_name(label)).join(gallery_dir_name(gid, title))
 }
 
 /// Page file name (1-based, zero padded to 8), e.g. `00000001.jpg`.
@@ -205,6 +226,22 @@ mod tests {
     }
 
     #[test]
+    fn label_dirs() {
+        // Empty / whitespace labels fall back to the default folder.
+        assert_eq!(label_dir_name(""), DEFAULT_LABEL_DIR);
+        assert_eq!(label_dir_name("   "), DEFAULT_LABEL_DIR);
+        // Normal labels are preserved; special characters are sanitized.
+        assert_eq!(label_dir_name("Favorite"), "Favorite");
+        assert_eq!(label_dir_name("A/B:C"), "A_B_C");
+        let p = gallery_download_path(Path::new("R"), "", 42, "Hello World!");
+        assert_eq!(
+            p,
+            Path::new("R").join(DEFAULT_LABEL_DIR).join("42-Hello World_")
+        );
+        let p = gallery_download_path(Path::new("R"), "Fav", 7, "Caf_");
+        assert_eq!(p, Path::new("R").join("Fav").join("7-Caf_"));
+    }
+    #[test]
     fn roundtrip_spider_info() {
         let dir = std::env::temp_dir().join(format!("ehv-si-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -248,4 +285,3 @@ mod tests {
         assert_eq!(detect_image_ext(b"<html><body>error</body></html>"), None);
     }
 }
-

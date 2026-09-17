@@ -10,6 +10,7 @@
 //! system resolver.
 
 use std::net::IpAddr;
+use std::time::Duration;
 use std::sync::{OnceLock, RwLock};
 
 use base64::Engine;
@@ -18,13 +19,37 @@ use base64::Engine;
 static USE_BUILTIN: OnceLock<RwLock<bool>> = OnceLock::new();
 /// DoH endpoint override (example `https://223.5.5.5/dns-query`); empty = default.
 static DOH_URL: OnceLock<RwLock<Option<String>>> = OnceLock::new();
-/// Escalation flag: when false only the static IP table is used (fast cold start);
-/// set true on a transient failure so DoH + system DNS are also consulted.
+/// Online-resolution switch: when false only the static IP table is used (kept
+/// the default so unit tests run offline). Set true at app startup for the live
+/// path (builtin + fresh DoH merged) and kept true on a transient failure so a
+/// stale/blocked pinned IP is refreshed from DoH.
 static ALLOW_NETWORK: OnceLock<RwLock<bool>> = OnceLock::new();
 /// Per-host DoH refresh overrides. After a transient connect failure, fresh DoH
 /// results are cached here and prefixed to the bundled table so stale pinned
 /// IPs are replaced without editing the const table. Empty until first use.
 static REFRESH: OnceLock<RwLock<std::collections::HashMap<String, Vec<IpAddr>>>> = OnceLock::new();
+/// Dynamic image-host pins. When a reader/preview page hands us an image URL on a
+/// host outside the builtin table, we resolve it via DoH and pin the fresh IPs so
+/// a (possibly poisoned) system resolver is bypassed for that host.
+static IMAGE_PINS: OnceLock<RwLock<std::collections::HashMap<String, Vec<IpAddr>>>> = OnceLock::new();
+
+/// Stores fresh DoH-resolved IPs for a dynamically trusted image host; clearing
+/// removes the pin so the host falls back to normal resolution.
+pub fn set_image_host_ips(host: &str, ips: &[IpAddr]) {
+    let slot = IMAGE_PINS.get_or_init(|| RwLock::new(std::collections::HashMap::new()));
+    let mut m = slot.write().unwrap();
+    let v: Vec<IpAddr> = ips.iter().copied().filter(|i| !i.is_unspecified()).collect();
+    if v.is_empty() {
+        m.remove(host);
+    } else {
+        m.insert(host.to_string(), v);
+    }
+}
+
+/// Whether `host` already has static/dynamic pins, so callers skip a re-resolve.
+pub fn is_pinned(host: &str) -> bool {
+    pinned_hosts().iter().any(|h| h == host)
+}
 
 /// Stores fresh DoH results for a host as preferred overrides. Empty input
 /// clears the override so a host falls back to the bundled table.
@@ -197,6 +222,13 @@ pub fn pinned_hosts() -> Vec<String> {
             }
         }
     }
+    if let Some(m) = IMAGE_PINS.get() {
+        for h in m.read().unwrap().keys() {
+            if !out.iter().any(|x| x == h) {
+                out.push(h.clone());
+            }
+        }
+    }
     out
 }
 
@@ -216,10 +248,10 @@ pub fn builtin_hosts(host: &str) -> Vec<IpAddr> {
 }
 
 /// Resolve `host` (EH hosts only) bypassing the OS resolver entirely.
-/// Fast/cold-start path: bundled table only (no network), in stable table order
-/// so the first connect hits a reachable anycast IP. After a transient failure
-/// (or when the bundled table is disabled) it merges builtin + DoH, refreshing
-/// the override table from DoH so a stale/blocked pinned IP is replaced.
+/// Live path (online): bundles the static IPv4 table first with fresh DoH results,
+/// so a stale/blocked pinned IP is replaced without waiting for a failure. The
+/// system resolver is never consulted for these EH hosts. Offline (unit tests) keeps
+/// the bundled table only.
 pub async fn resolve(host: &str) -> Vec<IpAddr> {
     if allow_network() || !use_builtin() {
         return resolve_bypass_system(host).await;
@@ -256,11 +288,25 @@ fn order_and_filter(built: Vec<IpAddr>, doh: Vec<IpAddr>, sys: Vec<IpAddr>) -> V
     v4.extend(v6);
     v4
 }
+/// Upper bound for a single host's DoH resolution (all endpoints). Kept small so an
+/// unreachable DoH cannot stall client construction; on timeout we fall back to the
+/// bundled table (still reachability-ordered).
+const DOH_TOTAL_TIMEOUT: Duration = Duration::from_millis(1600);
+/// Per-IP reachability probe timeout. Cloudflare anycast either answers within a few
+/// hundred ms or drops the SYN, so a short bound lets us reorder quickly.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
+
+async fn doh_any(host: &str) -> Vec<IpAddr> {
+    tokio::time::timeout(DOH_TOTAL_TIMEOUT, doh_any_inner(host))
+        .await
+        .unwrap_or_default()
+}
+
 /// Tries the configured DoH, then AliDNS (223.5.5.5), then dns.alidns.com and
 /// Tencent DNSPod (doh.pub), returning the first non-empty result set so one
 /// broken endpoint no longer sinks the whole escalation (e.g. an IP-literal
 /// cert that TLS rejects).
-async fn doh_any(host: &str) -> Vec<IpAddr> {
+async fn doh_any_inner(host: &str) -> Vec<IpAddr> {
     let configured = doh_url();
     let mut endpoints = Vec::new();
     if !configured.is_empty() {
@@ -285,6 +331,47 @@ async fn doh_any(host: &str) -> Vec<IpAddr> {
     Vec::new()
 }
 
+/// Quick-reorders candidate IPs so a currently-reachable address is pinned first.
+/// Only meaningful in the online, direct-connect path: with no proxy we must reach
+/// the site ourselves, so a dead leading anycast edge must not eat a connect timeout.
+/// Mirrors OkHttp advancing through a request's address set. Offline callers (unit
+/// tests) keep the bundle-table order untouched.
+pub async fn probe_order(ips: Vec<IpAddr>) -> Vec<IpAddr> {
+    if !allow_network() || ips.len() < 2 {
+        return ips;
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for (i, ip) in ips.iter().copied().enumerate() {
+        set.spawn(async move {
+            let live = tokio::time::timeout(
+                PROBE_TIMEOUT,
+                tokio::net::TcpStream::connect((ip, 443)),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+            (i, live)
+        });
+    }
+    let mut ok = vec![false; ips.len()];
+    while let Some(out) = set.join_next().await {
+        if let Ok((i, live)) = out {
+            ok[i] = live;
+        }
+    }
+    let mut reachable = Vec::with_capacity(ips.len());
+    let mut dead = Vec::new();
+    for (i, ip) in ips.iter().enumerate() {
+        if ok[i] {
+            reachable.push(*ip);
+        } else {
+            dead.push(*ip);
+        }
+    }
+    reachable.extend(dead);
+    reachable
+}
+
 fn dedup(v: &mut Vec<IpAddr>) {
     let mut seen = std::collections::HashSet::new();
     v.retain(|ip| seen.insert(*ip));
@@ -298,6 +385,11 @@ fn builtin(host: &str) -> Vec<IpAddr> {
         }
     }
     if let Some(m) = REFRESH.get() {
+        if let Some(ips) = m.read().unwrap().get(host) {
+            out.extend(ips.iter().copied());
+        }
+    }
+    if let Some(m) = IMAGE_PINS.get() {
         if let Some(ips) = m.read().unwrap().get(host) {
             out.extend(ips.iter().copied());
         }
@@ -378,11 +470,23 @@ async fn system_lookup(host: &str) -> Vec<IpAddr> {
     v
 }
 
+/// Shared DoH HTTP client (built once, reused across hosts/endpoints).
+static DOH_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn doh_http() -> reqwest::Client {
+    DOH_HTTP
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("failed to build DoH client")
+        })
+        .clone()
+}
+
 async fn doh_lookup(doh: &str, host: &str) -> anyhow::Result<Vec<IpAddr>> {
-    let cli = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(3))
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
+    let cli = doh_http();
     let mut out = Vec::new();
     // Query A then AAAA.
     for qtype in [1u16, 28u16] {

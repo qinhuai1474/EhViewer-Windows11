@@ -13,10 +13,12 @@ interface Props {
 
 export function GalleryView({ item, onExit }: Props) {
   const [stage, setStage] = useState<Stage>("detail");
-  const [readIndex, setReadIndex] = useState(0);
+  // `undefined` = enter from detail (respect reading_start_position / resume),
+  // a number = explicit page chosen from the preview grid.
+  const [readStart, setReadStart] = useState<number | undefined>(undefined);
 
-  const goRead = (index: number) => {
-    setReadIndex(index);
+  const goRead = (index?: number) => {
+    setReadStart(index);
     setStage("reader");
   };
 
@@ -24,7 +26,7 @@ export function GalleryView({ item, onExit }: Props) {
     return (
       <ReaderPage
         item={item}
-        startIndex={readIndex}
+        startIndex={readStart}
         onBack={() => setStage("detail")}
       />
     );
@@ -43,7 +45,7 @@ export function GalleryView({ item, onExit }: Props) {
       item={item}
       onBack={onExit}
       onPreviews={() => setStage("previews")}
-      onRead={goRead}
+      onRead={() => goRead()}
     />
   );
 }

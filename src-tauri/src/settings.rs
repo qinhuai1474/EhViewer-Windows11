@@ -64,6 +64,9 @@ pub struct Settings {
     pub image_cache_size_mb: u32,
     /// Optional custom EH host override (for self-hosted / mirror setups).
     pub custom_host: Option<String>,
+    /// Extra image CDN/host allowlist (comma/newline separated), trusted by
+    /// `fetch_image` in addition to the EH site family. Mirrors/custom mirrors.
+    pub image_host_allowlist: String,
     /// DNS-over-HTTPS resolver host (empty = default AliDNS endpoint).
     pub doh_url: String,
     /// Prefer the bundled E-Hentai IP table before DoH resolution.
@@ -102,6 +105,7 @@ impl Default for Settings {
             max_retries: 3,
             image_cache_size_mb: 100,
             custom_host: None,
+            image_host_allowlist: String::new(),
             doh_url: String::new(),
             use_builtin_hosts: true,
             close_to_tray: true,

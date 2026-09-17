@@ -82,6 +82,69 @@ pub fn is_allowed_url(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Lowercased host of a URL, if it parses.
+pub fn url_host(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+}
+
+/// User-configured extra image hosts (mirrors / CDN) trusted by `fetch_image`.
+static TRUSTED_IMAGE_HOSTS: OnceLock<RwLock<std::collections::HashSet<String>>> = OnceLock::new();
+/// Hosts discovered from image URLs parsed out of EH pages (reader origin / thumbs).
+static PARSED_IMAGE_HOSTS: OnceLock<RwLock<std::collections::HashSet<String>>> = OnceLock::new();
+
+/// Whether `host` is an extra image host (user-configured or parsed from a page).
+/// These are trusted for image fetch, and get the EH Referer but not cookies.
+pub fn is_trusted_image_host(host: &str) -> bool {
+    let h = host.trim().to_ascii_lowercase();
+    let cfg = TRUSTED_IMAGE_HOSTS
+        .get()
+        .map(|s| s.read().unwrap().contains(&h))
+        .unwrap_or(false);
+    let parsed = PARSED_IMAGE_HOSTS
+        .get()
+        .map(|s| s.read().unwrap().contains(&h))
+        .unwrap_or(false);
+    cfg || parsed
+}
+
+/// Whether `url` is fetchable as an image: the EH site family/CDN or a trusted
+/// (dynamically/user-configured) image host.
+pub fn is_allowed_image_url(url: &str) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| is_eh_host(h) || is_trusted_image_host(h)))
+        .unwrap_or(false)
+}
+
+/// Trusts the host(s) used by image URLs that were parsed out of EH pages, so
+/// `fetch_image` can load legitimate reader/preview origin hosts even when they
+/// aren't part of the fixed site family (mirrors SXJ trusting page-sourced URLs).
+pub fn add_trusted_image_urls<I: IntoIterator<Item = String>>(urls: I) {
+    let set = PARSED_IMAGE_HOSTS.get_or_init(|| RwLock::new(std::collections::HashSet::new()));
+    let mut m = set.write().unwrap();
+    for u in urls {
+        if let Some(host) = url_host(&u) {
+            m.insert(host);
+        }
+    }
+}
+
+/// Replaces the user-configured image-host allowlist (comma / newline separated).
+pub fn set_image_host_allowlist(list: &str) {
+    let set = TRUSTED_IMAGE_HOSTS.get_or_init(|| RwLock::new(std::collections::HashSet::new()));
+    let mut m = set.write().unwrap();
+    m.clear();
+    for piece in list.split(|c: char| c == ',' || c == ';' || c.is_ascii_whitespace()) {
+        let p = piece.trim().trim_matches('/').to_ascii_lowercase();
+        if !p.is_empty() {
+            m.insert(p);
+        }
+    }
+}
+
+
 /// Returns the active domain: the host override if set, else the default for `site`.
 pub fn domain(site: u8) -> String {
     if let Some(h) = HOST_OVERRIDE.get().and_then(|l| l.read().unwrap().clone()) {

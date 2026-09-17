@@ -8,7 +8,7 @@ pub mod queen;
 pub mod spider;
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +20,7 @@ use crate::db::{Db, DownloadDto, DownloadRecord, DownloadState};
 use crate::settings::Settings;
 
 use queen::{ImageFetcher, NetworkImageFetcher, QueenResult, SpiderQueen};
-use spider::{gallery_dir_name, SpiderInfo, SPIDER_INFO_FILENAME};
+use spider::{gallery_dir_name, gallery_download_path, SpiderInfo, SPIDER_INFO_FILENAME};
 
 /// Emitted with the full download list whenever a download changes.
 pub const EV_DOWNLOAD_CHANGED: &str = "download-changed";
@@ -41,6 +41,9 @@ struct AsyncState {
     queue: VecDeque<u64>,
     running: Option<u64>,
     cancels: HashMap<u64, Arc<AtomicBool>>,
+    /// gid -> target dir for labels changed while the gallery was still
+    /// downloading; the move is applied once the active worker completes.
+    pending_moves: HashMap<u64, PathBuf>,
     /// Gallery-level retry counter so a failed task is retried (up to
     /// `max_retries`) and the queue still drains to full completion.
     retries: HashMap<u64, u32>,
@@ -71,6 +74,7 @@ impl DownloadManager {
                 queue: VecDeque::new(),
                 running: None,
                 cancels: HashMap::new(),
+                pending_moves: HashMap::new(),
                 retries: HashMap::new(),
             }),
             notify: Arc::new(Notify::new()),
@@ -148,7 +152,11 @@ impl DownloadManager {
         }
         if erase {
             if let Some(rec) = self.db.get_download(gid).map_err(|e| e.to_string())? {
-                let dir = self.download_root().join(gallery_dir_name(gid, &rec.title));
+                let dir = if !rec.dir.is_empty() {
+                    PathBuf::from(&rec.dir)
+                } else {
+                    gallery_download_path(&self.download_root(), &rec.label, gid, &rec.title)
+                };
                 std::fs::remove_dir_all(&dir).ok();
             }
         }
@@ -157,11 +165,31 @@ impl DownloadManager {
         Ok(())
     }
 
-    /// Renames a download's label.
-    pub fn relabel_download(&self, gid: u64, label: &str) -> Result<(), String> {
+    /// Renames a download's label and moves its on-disk folder to the new
+    /// label sub-folder. When the gallery is still downloading the move is
+    /// deferred until the active worker finishes to avoid writing to a path
+    /// that is being relocated beneath it.
+    pub async fn relabel_download(&self, gid: u64, label: &str) -> Result<(), String> {
+        let old = self.db.get_download(gid).map_err(|e| e.to_string())?;
         self.db
             .relabel_download(gid, label)
             .map_err(|e| e.to_string())?;
+        if let Some(rec) = old {
+            let root = self.download_root();
+            let new_dir = gallery_download_path(&root, label, gid, &rec.title);
+            let old_dir = if !rec.dir.is_empty() {
+                PathBuf::from(&rec.dir)
+            } else {
+                gallery_download_path(&root, &rec.label, gid, &rec.title)
+            };
+            if old_dir != new_dir && old_dir.is_dir() {
+                if DownloadState::from_i32(rec.state) == DownloadState::Download {
+                    self.state.lock().await.pending_moves.insert(gid, new_dir);
+                } else {
+                    self.move_gallery_folder(gid, &old_dir, &new_dir);
+                }
+            }
+        }
         self.emit_changed();
         Ok(())
     }
@@ -209,6 +237,7 @@ impl DownloadManager {
                     st.retries.remove(&gid);
                 }
             }
+            self.apply_pending_move(gid).await;
 
             let interval = self.download_interval();
             if outcome == GalleryOutcome::Failed && self.maybe_requeue(gid).await {
@@ -233,7 +262,7 @@ impl DownloadManager {
             return GalleryOutcome::Failed;
         };
         let root = self.download_root();
-        let dir = root.join(gallery_dir_name(gid, &rec.title));
+        let dir = gallery_download_path(&root, &rec.label, gid, &rec.title);
         if std::fs::create_dir_all(&dir).is_err() {
             let _ = self.db.set_download_state(gid, DownloadState::Failed.as_i32());
             self.emit_changed();
@@ -313,6 +342,7 @@ impl DownloadManager {
     /// Re-queues incomplete galleries saved in WAIT/DOWNLOAD/FAILED on startup,
     /// and re-syncs their complete count from disk.
     async fn restore(&self) {
+        self.migrate_flat_dirs().await;
         let recs = self.db.list_downloads().unwrap_or_default();
         let mut any = false;
         for rec in &recs {
@@ -345,6 +375,55 @@ impl DownloadManager {
             self.notify.notify_one();
         }
         self.emit_changed();
+    }
+
+    /// Migrates galleries still sitting flat under the download root (the old
+    /// `<root>/<gid>-<title>` layout) into their label sub-folder. Idempotent:
+    /// after the first run the record's `dir` points inside the label folder,
+    /// so nothing is moved again.
+    async fn migrate_flat_dirs(&self) {
+        let root = self.download_root();
+        let recs = self.db.list_downloads().unwrap_or_default();
+        for rec in &recs {
+            let target = gallery_download_path(&root, &rec.label, rec.gid, &rec.title);
+            if target.is_dir() {
+                continue;
+            }
+            let old = if rec.dir.is_empty() {
+                root.join(gallery_dir_name(rec.gid, &rec.title))
+            } else {
+                PathBuf::from(&rec.dir)
+            };
+            if is_flat_under(&root, &old) && old.is_dir() {
+                self.move_gallery_folder(rec.gid, &old, &target);
+            }
+        }
+    }
+
+    /// Applies a deferred label move recorded while a gallery was downloading
+    /// (safe now that that gallery is no longer being written to).
+    async fn apply_pending_move(&self, gid: u64) {
+        let new_dir = self.state.lock().await.pending_moves.remove(&gid);
+        if let Some(new_dir) = new_dir {
+            if let Some(rec) = self.db.get_download(gid).ok().flatten() {
+                if !rec.dir.is_empty() {
+                    let old = PathBuf::from(&rec.dir);
+                    if old != new_dir && self.move_gallery_folder(gid, &old, &new_dir) {
+                        self.emit_changed();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Renames a gallery folder (creating the destination parent) and keeps the
+    /// stored `dir` in sync. Returns whether a move actually happened.
+    fn move_gallery_folder(&self, gid: u64, old: &Path, new: &Path) -> bool {
+        if relocate_gallery_dir(&self.db, gid, old, new) {
+            true
+        } else {
+            false
+        }
     }
 
     fn download_root(&self) -> PathBuf {
@@ -421,6 +500,29 @@ fn may_retry(attempt: u32, max: u32) -> bool {
     attempt <= max
 }
 
+/// True when `path` sits directly under `root` (the old flat layout) rather
+/// than under a label sub-folder.
+fn is_flat_under(root: &Path, path: &Path) -> bool {
+    path.parent().map_or(false, |p| p == root)
+}
+
+/// Moves the gallery folder `old` -> `new` (creating `new`'s parent) and, on
+/// success, updates the stored download `dir`. Must be called while the gallery
+/// is not being written to, to avoid racing the active spider.
+fn relocate_gallery_dir(db: &Db, gid: u64, old: &Path, new: &Path) -> bool {
+    if old == new || !old.is_dir() {
+        return false;
+    }
+    if let Some(parent) = new.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let moved = std::fs::rename(old, new).is_ok();
+    if moved {
+        let _ = db.set_download_dir(gid, &new.to_string_lossy());
+    }
+    moved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,5 +543,46 @@ mod tests {
         assert_eq!(s.download_interval_secs, 5, "default interval is 5s");
         let d = Duration::from_secs(s.download_interval_secs);
         assert_eq!(d, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn flat_detection() {
+        let root = Path::new("R");
+        assert!(is_flat_under(root, &root.join("1-Gal")));
+        assert!(!is_flat_under(root, &root.join("Fav").join("1-Gal")));
+        assert!(!is_flat_under(root, Path::new("other")));
+    }
+
+    #[test]
+    fn relocate_moves_folder_and_updates_dir() {
+        let root = std::env::temp_dir().join(format!("ehv-mv-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = Db::open(&root.join("test.sqlite")).unwrap();
+        db.upsert_download(&DownloadRecord {
+            gid: 1,
+            token: String::new(),
+            title: "Gal".into(),
+            label: String::new(),
+            state: DownloadState::Finish.as_i32(),
+            total: 10,
+            complete: 10,
+            dir: String::new(),
+            url: String::new(),
+        })
+        .unwrap();
+        let flat = root.join("1-Gal");
+        let wrapped = root.join("Fav").join("1-Gal");
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(flat.join("00000001.jpg"), b"x").unwrap();
+
+        assert!(relocate_gallery_dir(&db, 1, &flat, &wrapped));
+        assert!(!flat.exists());
+        assert!(wrapped.join("00000001.jpg").is_file());
+        let rec = db.get_download(1).unwrap().unwrap();
+        assert_eq!(rec.dir, wrapped.to_string_lossy());
+
+        // Relocating again to the same place is a no-op.
+        assert!(!relocate_gallery_dir(&db, 1, &wrapped, &wrapped));
+        std::fs::remove_dir_all(&root).ok();
     }
 }

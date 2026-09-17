@@ -207,6 +207,10 @@
   margin-left: auto;
   color: var(--color-text-dim);
 }
+.reader-slider {
+  width: 140px;
+  accent-color: var(--color-accent);
+}
 .reader-viewport {
   flex: 1;
   overflow: auto;
@@ -233,6 +237,10 @@
 .reader-img-v {
   display: block;
   margin: 0 auto;
+  /* Skip layout/paint of far-offscreen pages so long vertical galleries stay
+   * smooth; `contain-intrinsic-size` keeps the scrollbar stable. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 500px;
 }
 .reader-progress {
   position: fixed;
@@ -267,4 +275,81 @@
   background: #2a2e35;
   color: #e6e9ee;
   border: 1px solid #3a3f47;
+}
+
+
+/* Reader loading spinner - replaces the blank unloaded area while a page is
+ * fetched so the user can see loading progress. */
+.reader-loading {
+  width: 48px;
+  height: 48px;
+  border: 4px solid rgba(91, 141, 239, 0.25);
+  border-top-color: var(--color-accent);
+  border-radius: 50%;
+  animation: reader-spin 0.9s linear infinite;
+}
+.reader-loading-block {
+  width: 64px;
+  height: 64px;
+  margin: 40px auto;
+  border: 4px solid rgba(91, 141, 239, 0.25);
+  border-top-color: var(--color-accent);
+  border-radius: 50%;
+  animation: reader-spin 0.9s linear infinite;
+}
+/* Determinate variant: an arc filled by `background` (conic-gradient) plus a
+ * centered percentage. Shares the same size/radius as its spinner base but
+ * drops the animated border so the filled portion reads as real progress. */
+.reader-loading-det {
+  border: none;
+  animation: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+.reader-loading-det::before {
+  content: "";
+  position: absolute;
+  border-radius: 50%;
+  background: #101216;
+}
+.reader-loading.reader-loading-det::before,
+.reader-loading-block.reader-loading-det::before {
+  /* ring thickness = inset, kept at 4px to match the indeterminate border */
+  inset: 4px;
+}
+.reader-loading-det span {
+  position: relative;
+  z-index: 1;
+  color: var(--color-text);
+  font-size: 12px;
+}
+@keyframes reader-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* In-flow failure tile for a specific vertical page (SXJ-style per-page retry). */
+.reader-fail-block {
+  margin: 40px auto;
+  text-align: center;
+  color: #8895a7;
+  padding: 16px;
+}
+.reader-fail-block p {
+  margin: 0 0 10px;
+}
+.reader-fail-block button {
+  padding: 6px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  background: #2a2e35;
+  color: #e6e9ee;
+  border: 1px solid #3a3f47;
+}
+/* Sentinel that triggers forward prefetch when the reader nears the bottom. */
+.reader-sentinel {
+  height: 1px;
 }

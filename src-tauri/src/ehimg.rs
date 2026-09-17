@@ -83,7 +83,7 @@ fn err_response(msg: &str) -> Response<std::borrow::Cow<'static, [u8]>> {
 }
 
 async fn load_bytes(cache_dir: &Path, url: &str) -> Vec<u8> {
-    if !crate::client::url::is_allowed_url(url) {
+    if !crate::client::url::is_allowed_image_url(url) {
         return Vec::new();
     }
     let key = cache_key(url);
@@ -92,6 +92,9 @@ async fn load_bytes(cache_dir: &Path, url: &str) -> Vec<u8> {
     if file.exists() {
         return std::fs::read(&file).unwrap_or_default();
     }
+    // Pin a dynamically trusted image host (via DoH) before fetching so it is
+    // not resolved through the possibly-poisoned system resolver.
+    client::ensure_image_host(url).await;
     match client::get_bytes(url, None).await {
         Ok(bytes) => {
             let _ = std::fs::write(&file, &bytes);
@@ -102,11 +105,57 @@ async fn load_bytes(cache_dir: &Path, url: &str) -> Vec<u8> {
     }
 }
 
+/// Like [`load_bytes`] but reports download progress (`received`, `total`) while
+/// an uncached image streams in. `total == 0` means the server sent no
+/// Content-Length, so the caller should fall back to an indeterminate spinner.
+async fn load_bytes_with_progress<F>(cache_dir: &Path, url: &str, on_progress: &mut F) -> Vec<u8>
+where
+    F: FnMut(u64, u64),
+{
+    if !crate::client::url::is_allowed_image_url(url) {
+        return Vec::new();
+    }
+    let key = cache_key(url);
+    let ext = guess_ext(url);
+    let file = cache_dir.join(format!("{key}.{ext}"));
+    if file.exists() {
+        return std::fs::read(&file).unwrap_or_default();
+    }
+    client::ensure_image_host(url).await;
+    match client::get_bytes_with_progress(url, None, on_progress).await {
+        Ok(bytes) => {
+            let _ = std::fs::write(&file, &bytes);
+            enforce_cache_cap(cache_dir);
+            bytes
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Fetches an image with download progress and returns a `data:` URL. `on_progress`
+/// is called with `(received, total)` while the bytes stream in; `total` of 0
+/// means the length is unknown.
+pub async fn data_url_progress<F>(url: &str, mut on_progress: F) -> Result<String, String>
+where
+    F: FnMut(u64, u64),
+{
+    if !crate::client::url::is_allowed_image_url(url) {
+        return Err("图片地址不在允许的站点列表内".to_string());
+    }
+    let body = load_bytes_with_progress(&cache_dir(), url, &mut on_progress).await;
+    if body.is_empty() {
+        return Err("图片获取失败（网络或已失效）".to_string());
+    }
+    let ctype = content_type(guess_ext(url));
+    let b64 = base64::engine::general_purpose::STANDARD.encode(body);
+    Ok(format!("data:{ctype};base64,{b64}"))
+}
+
 /// Fetches (and caches) an image and returns a `data:` URL. Used as a command so
 /// the frontend can render images without depending on the custom `ehimg://`
 /// scheme, which is unreliable in the packaged WebView2.
 pub async fn data_url(url: &str) -> Result<String, String> {
-    if !crate::client::url::is_allowed_url(url) {
+    if !crate::client::url::is_allowed_image_url(url) {
         return Err("图片地址不在允许的站点列表内".to_string());
     }
     let body = load_bytes(&cache_dir(), url).await;
