@@ -34,6 +34,9 @@ pub struct DownloadRecord {
     pub token: String,
     pub title: String,
     pub label: String,
+    pub artist: String,
+    pub language: String,
+    pub group: String,
     pub state: i32,
     pub total: u32,
     pub complete: u32,
@@ -48,6 +51,9 @@ pub struct DownloadDto {
     pub token: String,
     pub title: String,
     pub label: String,
+    pub artist: String,
+    pub language: String,
+    pub group: String,
     pub state: String,
     pub total: u32,
     pub complete: u32,
@@ -62,6 +68,9 @@ impl From<&DownloadRecord> for DownloadDto {
             token: rec.token.clone(),
             title: rec.title.clone(),
             label: rec.label.clone(),
+            artist: rec.artist.clone(),
+            language: rec.language.clone(),
+            group: rec.group.clone(),
             state: DownloadState::from_i32(rec.state).as_str().to_string(),
             total: rec.total,
             complete: rec.complete,
@@ -108,6 +117,9 @@ impl Db {
                 token    TEXT NOT NULL,
                 title    TEXT NOT NULL DEFAULT '',
                 label    TEXT NOT NULL DEFAULT '',
+                artist   TEXT NOT NULL DEFAULT '',
+                language TEXT NOT NULL DEFAULT '',
+                circle   TEXT NOT NULL DEFAULT '',
                 state    INTEGER NOT NULL DEFAULT 0,
                 total    INTEGER NOT NULL DEFAULT 0,
                 complete INTEGER NOT NULL DEFAULT 0,
@@ -127,6 +139,24 @@ impl Db {
             );
             "#,
         )?;
+        // Idempotent migration for databases created before the rename metadata
+        // columns existed (older installs keep their `downloads` table shape).
+        for (col, decl) in [
+            ("artist", "TEXT NOT NULL DEFAULT ''"),
+            ("language", "TEXT NOT NULL DEFAULT ''"),
+            ("circle", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            let exists = conn
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('downloads') WHERE name=?1"
+                ))?
+                .query_map([col], |_| Ok(()))?
+                .next()
+                .is_some();
+            if !exists {
+                conn.execute_batch(&format!("ALTER TABLE downloads ADD COLUMN {col} {decl};"))?;
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -135,16 +165,20 @@ impl Db {
     pub fn upsert_download(&self, rec: &DownloadRecord) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO downloads(gid,token,title,label,state,total,complete,dir,url)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,'','')
+            "INSERT INTO downloads(gid,token,title,label,artist,language,circle,state,total,complete,dir,url)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'','')
              ON CONFLICT(gid) DO UPDATE SET
                token=excluded.token, title=excluded.title, label=excluded.label,
+               artist=excluded.artist, language=excluded.language, circle=excluded.circle,
                state=excluded.state, total=excluded.total, complete=excluded.complete",
             rusqlite::params![
                 rec.gid,
                 rec.token,
                 rec.title,
                 rec.label,
+                rec.artist,
+                rec.language,
+                rec.group,
                 rec.state,
                 rec.total,
                 rec.complete
@@ -156,7 +190,7 @@ impl Db {
     pub fn list_downloads(&self) -> rusqlite::Result<Vec<DownloadRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT gid,token,title,label,state,total,complete,dir,url FROM downloads ORDER BY gid",
+            "SELECT gid,token,title,label,artist,language,circle,state,total,complete,dir,url FROM downloads ORDER BY gid",
         )?;
         let rows = stmt
             .query_map([], map_record)?
@@ -167,7 +201,7 @@ impl Db {
     pub fn get_download(&self, gid: u64) -> rusqlite::Result<Option<DownloadRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT gid,token,title,label,state,total,complete,dir,url FROM downloads WHERE gid=?1")
+            .prepare("SELECT gid,token,title,label,artist,language,circle,state,total,complete,dir,url FROM downloads WHERE gid=?1")
             .unwrap();
         let mut rows = stmt.query_map([gid], map_record)?;
         rows.next().transpose()
@@ -267,11 +301,14 @@ fn map_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadRecord> {
         token: r.get(1)?,
         title: r.get(2)?,
         label: r.get(3)?,
-        state: r.get(4)?,
-        total: r.get(5)?,
-        complete: r.get(6)?,
-        dir: r.get(7)?,
-        url: r.get(8)?,
+        artist: r.get(4)?,
+        language: r.get(5)?,
+        group: r.get(6)?,
+        state: r.get(7)?,
+        total: r.get(8)?,
+        complete: r.get(9)?,
+        dir: r.get(10)?,
+        url: r.get(11)?,
     })
 }
 

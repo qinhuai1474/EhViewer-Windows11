@@ -150,7 +150,7 @@ export function DownloadsPage() {
     runBatch(
       selectedGids
         .filter((i) => i.state === "wait" || i.state === "failed" || i.state === "none")
-        .map((i) => () => downloadStart(i.gid, i.token, i.title, i.label, i.total, i.url)),
+        .map((i) => () => downloadStart(i.gid, i.token, i.title, i.label, "", "", "", i.total, i.url)),
     );
   };
   const batchStop = () => {
@@ -269,7 +269,7 @@ export function DownloadsPage() {
             checked={selected.has(d.gid)}
             onToggle={() => toggle(d.gid)}
             onStart={() =>
-              run(d.gid, downloadStart(d.gid, d.token, d.title, d.label, d.total, d.url))
+              run(d.gid, downloadStart(d.gid, d.token, d.title, d.label, "", "", "", d.total, d.url))
             }
             onStop={() => run(d.gid, downloadStop(d.gid))}
             onDelete={() => setDeleteFor([d.gid])}

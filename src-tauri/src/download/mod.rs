@@ -6,8 +6,9 @@
 
 pub mod queen;
 pub mod spider;
+pub mod naming;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -96,6 +97,9 @@ impl DownloadManager {
         token: String,
         title: String,
         label: String,
+        artist: String,
+        language: String,
+        group: String,
         total: u32,
         url: String,
     ) -> Result<(), String> {
@@ -104,6 +108,9 @@ impl DownloadManager {
             token,
             title,
             label,
+            artist,
+            language,
+            group,
             state: DownloadState::Wait.as_i32(),
             total: total.max(1),
             complete: 0,
@@ -200,7 +207,188 @@ impl DownloadManager {
         Ok(recs.iter().map(DownloadDto::from).collect())
     }
 
+    /// Recursively scans the download root for `<gid>-<title>` gallery folders and
+    /// renames them to `[Author] Title`, removing each renamed gallery from the
+    /// download queue (files stay on disk). `preview = true` computes the plan in
+    /// memory without touching the filesystem or the database, so the UI can show
+    /// before/after names and the user can cancel with zero side effects.
+    /// Scans the configured scan root (the fixed `rename_scan_dir` setting, or
+    /// the download root when empty) for `<gid>-<title>` gallery folders and
+    /// renames them to `[Author] Title`, removing each renamed gallery from the
+    /// download queue (files stay on disk). Only folders that actually contain
+    /// the `.ehviewer` marker are touched, so nothing outside the scan root is
+    /// ever renamed.
+    pub async fn rename_dirs(&self, preview: bool) -> Result<naming::RenameReport, String> {
+        let mut report = naming::RenameReport::default();
+        let root = self.rename_scan_root();
+        if !root.is_dir() {
+            return Ok(report);
+        }
+        let recs = self.db.list_downloads().map_err(|e| e.to_string())?;
+        let by_gid: HashMap<u64, &DownloadRecord> = recs.iter().map(|r| (r.gid, r)).collect();
+        let terms = self.rename_filter_terms();
+        let mut used = HashSet::new();
+        self.scan_for_rename(&root, &by_gid, &terms, &mut used, &mut report, preview);
+        if !preview && report.renamed > 0 {
+            self.emit_changed();
+        }
+        Ok(report)
+    }
+
     // ----- internal helpers -----
+
+    /// The directory the rename tool operates on: the fixed `rename_scan_dir`
+    /// when set, otherwise the download root.
+    fn rename_scan_root(&self) -> PathBuf {
+        let scan = self.settings.lock().unwrap().rename_scan_dir.clone();
+        if !scan.trim().is_empty() {
+            PathBuf::from(scan)
+        } else {
+            self.download_root()
+        }
+    }
+
+    /// The effective tag blocklist: user-configured terms when present, otherwise
+    /// the built-in defaults.
+    fn rename_filter_terms(&self) -> Vec<String> {
+        let terms = self.settings.lock().unwrap().rename_filter_terms.clone();
+        if terms.is_empty() {
+            naming::default_filter_terms()
+        } else {
+            terms
+        }
+    }
+
+    fn scan_for_rename(
+        &self,
+        dir: &Path,
+        by_gid: &HashMap<u64, &DownloadRecord>,
+        terms: &[String],
+        used: &mut HashSet<String>,
+        report: &mut naming::RenameReport,
+        preview: bool,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_dir())
+            .collect();
+        paths.sort();
+        for p in paths {
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if let Some((gid, _)) = naming::parse_old_folder_name(&name) {
+                // A folder is only a renameable gallery if it carries the
+                // `.ehviewer` index; anything else with a gid-like name is left
+                // strictly untouched (and not recursed into) so renames never
+                // spill into unrelated directories.
+                if p.join(SPIDER_INFO_FILENAME).is_file() {
+                    self.rename_one(&p, gid, by_gid, terms, used, report, preview);
+                }
+            } else {
+                self.scan_for_rename(&p, by_gid, terms, used, report, preview);
+            }
+        }
+    }
+
+    fn rename_one(
+        &self,
+        p: &Path,
+        gid: u64,
+        by_gid: &HashMap<u64, &DownloadRecord>,
+        terms: &[String],
+        used: &mut HashSet<String>,
+        report: &mut naming::RenameReport,
+        preview: bool,
+    ) {
+        let old_name = p
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Some(&rec) = by_gid.get(&gid) else {
+            self.push_report(report, gid, old_name, String::new(), "skipped", Some("不在下载队列"));
+            return;
+        };
+        if matches!(
+            DownloadState::from_i32(rec.state),
+            DownloadState::Wait | DownloadState::Download
+        ) {
+            self.push_report(report, gid, old_name, String::new(), "skipped", Some("下载中，跳过"));
+            return;
+        }
+        let artist = opt_str(rec.artist.as_str());
+        let language = opt_str(rec.language.as_str());
+        match naming::plan_rename(&rec.title, artist, language, terms) {
+            Err(skip) => {
+                self.push_report(
+                    report,
+                    gid,
+                    old_name,
+                    String::new(),
+                    "skipped",
+                    Some(&skip.to_string()),
+                );
+            }
+            Ok(new_name) => {
+                let parent = p.parent().unwrap_or(p);
+                let mut candidate = new_name.clone();
+                let mut n = 0u64;
+                while used.contains(&candidate) || parent.join(&candidate).exists() {
+                    n += 1;
+                    candidate = format!("{} {}", new_name, n);
+                }
+                used.insert(candidate.clone());
+                if preview {
+                    self.push_report(report, gid, old_name, candidate, "renamed", None);
+                } else {
+                    let new_path = parent.join(&candidate);
+                    match std::fs::rename(p, &new_path) {
+                        Ok(()) => {
+                            let _ = self.db.set_download_dir(gid, &new_path.to_string_lossy());
+                            let _ = self.db.delete_download(gid);
+                            self.push_report(report, gid, old_name, candidate, "renamed", None);
+                        }
+                        Err(e) => self.push_report(
+                            report,
+                            gid,
+                            old_name,
+                            candidate,
+                            "failed",
+                            Some(&format!("重命名失败：{e}")),
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    fn push_report(
+        &self,
+        report: &mut naming::RenameReport,
+        gid: u64,
+        old_name: String,
+        new_name: String,
+        status: &str,
+        reason: Option<&str>,
+    ) {
+        report.entries.push(naming::RenameEntry {
+            gid,
+            old_name,
+            new_name,
+            status: status.to_string(),
+            reason: reason.map(str::to_string),
+        });
+        match status {
+            "renamed" => report.renamed += 1,
+            "skipped" => report.skipped += 1,
+            _ => report.failed += 1,
+        }
+    }
 
     /// Single background worker: pulls the next waiting gallery in FIFO order,
     /// runs it to completion, then rests the configured interval before the next
@@ -506,6 +694,16 @@ fn is_flat_under(root: &Path, path: &Path) -> bool {
     path.parent().map_or(false, |p| p == root)
 }
 
+/// `Some(s)` when the stored field is non-empty, else `None` (used to pass
+/// optional author / language metadata into the rename pipeline).
+fn opt_str(s: &str) -> Option<&str> {
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// Moves the gallery folder `old` -> `new` (creating `new`'s parent) and, on
 /// success, updates the stored download `dir`. Must be called while the gallery
 /// is not being written to, to avoid racing the active spider.
@@ -563,6 +761,9 @@ mod tests {
             token: String::new(),
             title: "Gal".into(),
             label: String::new(),
+            artist: String::new(),
+            language: String::new(),
+            group: String::new(),
             state: DownloadState::Finish.as_i32(),
             total: 10,
             complete: 10,

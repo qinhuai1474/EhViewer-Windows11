@@ -31,12 +31,36 @@ export function DetailPage({ item, onBack, onPreviews, onRead }: Props) {
   const d = detail;
   const title = showJpn && d?.titleJpn ? d.titleJpn : (d?.title ?? item.title);
 
+  // Extract author / language / circle from the namespaced detail tags so the
+  // rename pipeline can work offline later. Author priority: artist > group >
+  // uploader.
+  const nsTags = new Map<string, string[]>(
+    (d?.tags ?? []).map((g) => [
+      String(g.name ?? "").replace(/:$/i, "").trim().toLowerCase(),
+      (g.tags ?? []) as string[],
+    ]),
+  );
+  const artistFrom = nsTags.get("artist")?.[0] ?? "";
+  const groupFrom = nsTags.get("group")?.[0] ?? nsTags.get("circle")?.[0] ?? "";
+  const languageFrom = nsTags.get("language")?.[0] ?? d?.language ?? "";
+  const author = artistFrom || groupFrom || d?.uploader || "";
+
   const onDownload = () => {
     if (!d) return;
     setDlMsg(null);
     // GalleryItem has no `url`; use the canonical detail URL (metadata only).
     const galleryUrl = `https://e-hentai.org/g/${item.gid}/${item.token}/`;
-    downloadStart(item.gid, item.token, d.title || item.title, "", d.pages, galleryUrl)
+    downloadStart(
+      item.gid,
+      item.token,
+      d.title || item.title,
+      "",
+      author,
+      languageFrom,
+      groupFrom,
+      d.pages,
+      galleryUrl,
+    )
       .then(() => setDlMsg("已加入下载队列"))
       .catch((e) => setDlMsg("下载失败：" + String(e)));
   };

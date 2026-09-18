@@ -185,11 +185,15 @@ async fn download_start(
     token: String,
     title: String,
     label: String,
+    artist: String,
+    language: String,
+    group: String,
     total: u32,
     url: String,
 ) -> Result<(), String> {
     let m = app.state::<Arc<DownloadManager>>();
-    m.start_download(gid, token, title, label, total, url).await
+    m.start_download(gid, token, title, label, artist, language, group, total, url)
+        .await
 }
 
 /// Pauses a download, keeping its progress.
@@ -218,6 +222,19 @@ async fn download_relabel(app: tauri::AppHandle, gid: u64, label: String) -> Res
 async fn download_list(app: tauri::AppHandle) -> Result<Vec<db::DownloadDto>, String> {
     let m = app.state::<Arc<DownloadManager>>();
     m.list_downloads()
+}
+
+/// Recursively renames downloaded gallery folders to `[Author] Title` and removes
+/// them from the download queue. `preview = true` only builds the before/after
+/// plan in memory (no filesystem or database writes) so the UI can confirm or
+/// cancel without side effects.
+#[tauri::command]
+async fn rename_download_dirs(
+    app: tauri::AppHandle,
+    preview: bool,
+) -> Result<download::naming::RenameReport, String> {
+    let m = app.state::<Arc<DownloadManager>>();
+    m.rename_dirs(preview).await
 }
 
 
@@ -414,6 +431,19 @@ fn set_setting_field(s: &mut settings::Settings, key: &str, value: &serde_json::
         "download_always_original" => s.download_always_original = value.as_bool().unwrap_or(false),
         "download_list_page_size" => s.download_list_page_size = value.as_u64().unwrap_or(12) as u32,
         "download_interval_secs" => s.download_interval_secs = value.as_u64().unwrap_or(5) as u64,
+        "rename_filter_terms" => {
+            s.rename_filter_terms = value
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|v| v.to_string())
+                        .filter(|v| !v.trim().is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        "rename_scan_dir" => s.rename_scan_dir = str_v.unwrap_or_default(),
         "proxy_type" => s.proxy_type = (value.as_u64().unwrap_or(0) as u8).min(3),
         "proxy_url" => s.proxy_url = some_str,
         "hosts_override" => s.hosts_override = str_v.unwrap_or_default(),
@@ -438,6 +468,9 @@ fn record_from_json(v: &serde_json::Value) -> Option<db::DownloadRecord> {
         token: v.get("token").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         title: v.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         label: v.get("label").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        artist: v.get("artist").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        language: v.get("language").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        group: v.get("group").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         state: state_from_json(v.get("state")),
         total: v.get("total").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
         complete: v.get("complete").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
@@ -595,6 +628,7 @@ pub fn run() {
             download_delete,
             download_relabel,
             download_list,
+            rename_download_dirs,
             settings_get,
             settings_set,
             cookie_save,

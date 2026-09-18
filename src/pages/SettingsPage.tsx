@@ -9,6 +9,9 @@ import {
   settingsGet,
   settingsSet,
   type NetDiag,
+  renameGalleryDirs,
+  DEFAULT_RENAME_TERMS,
+  type RenameReport,
 } from "../lib/api";
 import type { AppSettings, CookiePair } from "../lib/types";
 import "./settings.css";
@@ -58,12 +61,22 @@ export function SettingsPage() {
   const [tagMsg, setTagMsg] = useState<string | null>(null);
   const [diag, setDiag] = useState<NetDiag | null>(null);
   const [diagBusy, setDiagBusy] = useState(false);
+  const [renameTerms, setRenameTerms] = useState<string[]>([]);
+  const [termInput, setTermInput] = useState("");
+  const [renamePreview, setRenamePreview] = useState<RenameReport | null>(null);
+  const [renameBusy, setRenameBusy] = useState(false);
 
   useEffect(() => {
     settingsGet().then(setSettings).catch((e) => setErr(String(e)));
   }, []);
   useEffect(() => {
     if (settings?.tag_translation_file) setTagPath(settings.tag_translation_file);
+  }, [settings]);
+  useEffect(() => {
+    if (!settings) return;
+    setRenameTerms(
+      settings.rename_filter_terms?.length ? settings.rename_filter_terms : DEFAULT_RENAME_TERMS,
+    );
   }, [settings]);
 
   const apply = (key: keyof AppSettings | string, value: unknown) => {
@@ -144,6 +157,67 @@ export function SettingsPage() {
       setErr(String(e));
     } finally {
       setDiagBusy(false);
+    }
+  };
+
+  const applyRenameTerms = (terms: string[]) => {
+    setRenameTerms(terms);
+    setSettings((prev) => (prev ? { ...prev, rename_filter_terms: terms } : prev));
+    settingsSet("rename_filter_terms", terms)
+      .then((s) => {
+        setSettings(s);
+        setFlash("已保存");
+      })
+      .catch((e) => setErr(String(e)));
+  };
+
+  const addTerm = () => {
+    const parts = termInput
+      .split(/[\s,，;；]+/)
+      .map((t) => t.trim())
+      .filter(Boolean);
+    if (!parts.length) return;
+    applyRenameTerms(Array.from(new Set([...renameTerms, ...parts])));
+    setTermInput("");
+  };
+
+  const removeTerm = (t: string) => applyRenameTerms(renameTerms.filter((x) => x !== t));
+
+  const resetTerms = () => {
+    setTermInput("");
+    setRenameTerms(DEFAULT_RENAME_TERMS);
+    settingsSet("rename_filter_terms", [])
+      .then((s) => {
+        setSettings(s);
+        setFlash("已重置为默认过滤清单");
+      })
+      .catch((e) => setErr(String(e)));
+  };
+
+  const scanPreview = async () => {
+    setRenameBusy(true);
+    setErr(null);
+    try {
+      setRenamePreview(await renameGalleryDirs(true));
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setRenameBusy(false);
+    }
+  };
+
+  const confirmRename = async () => {
+    if (!renamePreview) return;
+    setRenameBusy(true);
+    setErr(null);
+    try {
+      const r = await renameGalleryDirs(false);
+      setRenamePreview(null);
+      setFlash(`已重命名 ${r.renamed} 项并移出队列（跳过 ${r.skipped}，失败 ${r.failed}）`);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setRenameBusy(false);
     }
   };
 
@@ -233,6 +307,48 @@ export function SettingsPage() {
         </div>
       </Section>
 
+      <Section title="画廊重命名">
+        <p className="st-hint">
+          仅处理下方固定扫描目录内的画廊文件夹（含其子目录），把
+          <code> gid-标题 </code> 重命名为 <code>[作者] 作品</code>，并从下载队列移除（磁盘文件保留）；该目录之外一律不改动。
+        </p>
+        <div className="st-grid" style={{ marginTop: 10 }}>
+          <TextSetting
+            label="扫描目录（固定路径）"
+            value={s.rename_scan_dir ?? ""}
+            placeholder="留空使用下载根目录"
+            onChange={(v) => apply("rename_scan_dir", v)}
+          />
+        </div>
+        <CollapseSection title="标签库（过滤无用标签）">
+          <div className="rn-terms">
+            {renameTerms.map((t) => (
+              <span key={t} className="rn-chip">
+                {t}
+                <button onClick={() => removeTerm(t)} aria-label={`移除 ${t}`}>×</button>
+              </span>
+            ))}
+          </div>
+          <div className="rn-add">
+            <input
+              className="rn-input"
+              placeholder="输入标签关键词，回车添加，支持空格 / 逗号分隔…"
+              value={termInput}
+              onChange={(e) => setTermInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addTerm()}
+            />
+            <button onClick={addTerm} disabled={!termInput.trim()}>添加</button>
+            <button onClick={resetTerms}>重置为默认</button>
+          </div>
+        </CollapseSection>
+        <div className="st-actions">
+          <button className="primary" onClick={scanPreview} disabled={renameBusy}>
+            {renameBusy ? "处理中…" : "扫描并预览"}
+          </button>
+        </div>
+        <p className="st-hint">先扫描预览再执行；取消不会有任何改动。</p>
+      </Section>
+
       <Section title="隐私">
         <div className="st-actions">
           <button onClick={doExport}>导出数据</button>
@@ -277,6 +393,15 @@ export function SettingsPage() {
           </div>
         )}
       </Section>
+
+      {renamePreview && (
+        <RenamePreviewModal
+          report={renamePreview}
+          busy={renameBusy}
+          onConfirm={confirmRename}
+          onClose={() => setRenamePreview(null)}
+        />
+      )}
     </section>
   );
 }
@@ -287,6 +412,89 @@ function Section({ title, children }: { title: string; children: React.ReactNode
       <h2 className="st-title">{title}</h2>
       {children}
     </section>
+  );
+}
+
+function CollapseSection({
+  title,
+  defaultOpen = false,
+  children,
+}: {
+  title: string;
+  defaultOpen?: boolean;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <section className="st-section">
+      <button
+        className="st-collapse-head"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+      >
+        <span className="st-collapse-title">{title}</span>
+        <span className="st-collapse-arrow">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && children}
+    </section>
+  );
+}
+
+function RenamePreviewModal({
+  report,
+  busy,
+  onConfirm,
+  onClose,
+}: {
+  report: RenameReport;
+  busy: boolean;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="rn-modal-backdrop" onMouseDown={onClose}>
+      <div className="rn-modal" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="rn-modal-title">
+          重命名预览（将重命名 {report.renamed} 项
+          {report.skipped > 0 ? `，跳过 ${report.skipped} 项` : ""}
+          {report.failed > 0 ? `，失败 ${report.failed} 项` : ""}）
+        </div>
+        <div className="rn-modal-scroll">
+          <table className="rn-preview">
+            <thead>
+              <tr>
+                <th>重命名前</th>
+                <th>重命名后</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              {report.entries.map((e, i) => (
+                <tr key={`${e.gid}-${i}`}>
+                  <td className={`rn-old${e.status === "skipped" ? " skip" : ""}`}>{e.oldName}</td>
+                  <td className="rn-new">{e.newName || "—"}</td>
+                  <td className={`rn-status ${e.status}`}>
+                    {e.status === "renamed" ? "改名" : e.status}
+                    {e.reason ? <span className="rn-reason">{e.reason}</span> : null}
+                  </td>
+                </tr>
+              ))}
+              {report.entries.length === 0 && (
+                <tr>
+                  <td colSpan={3} className="rn-empty">未在下载目录下发现可重命名的画廊文件夹。</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="rn-modal-actions">
+          <button onClick={onClose} disabled={busy}>取消</button>
+          <button className="danger" onClick={onConfirm} disabled={busy || report.renamed === 0}>
+            {busy ? "处理中…" : "确认重命名并从队列移除"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 

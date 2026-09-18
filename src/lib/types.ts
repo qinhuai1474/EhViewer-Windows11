@@ -91,6 +91,8 @@ export interface AppSettings {
   download_always_original: boolean;
   download_list_page_size: number;
   download_interval_secs: number;
+  rename_filter_terms: string[];
+  rename_scan_dir: string;
   proxy_type: number;
   proxy_url: string | null;
   hosts_override: string;

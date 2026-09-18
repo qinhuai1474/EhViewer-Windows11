@@ -48,6 +48,12 @@ pub struct Settings {
     pub download_list_page_size: u32,
     /// Seconds to wait between consecutive queue downloads (0 = no wait).
     pub download_interval_secs: u64,
+    /// User-defined tags stripped when renaming gallery folders. Empty = the
+    /// built-in default list (see `download::naming::default_filter_terms`).
+    pub rename_filter_terms: Vec<String>,
+    /// Fixed folder scanned by the gallery rename tool. Empty = the configured
+    /// download root. Never falls back to or touches anything outside this path.
+    pub rename_scan_dir: String,
 
     // ----- advanced -----
     /// Proxy type: 0 = direct, 1 = system, 2 = HTTP, 3 = SOCKS5 (mirrors SXJ).
@@ -98,6 +104,8 @@ impl Default for Settings {
             download_always_original: false,
             download_list_page_size: 12,
             download_interval_secs: 5,
+            rename_filter_terms: Vec::new(),
+            rename_scan_dir: String::new(),
             proxy_type: 0,
             proxy_url: None,
             hosts_override: String::new(),

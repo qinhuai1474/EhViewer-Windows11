@@ -21,7 +21,7 @@ export function GalleryCard({ item, onClick, queued = false }: Props) {
     if (queued || dl !== "idle") return;
     setDl("busy");
     const canonical = `https://e-hentai.org/g/${item.gid}/${item.token}/`;
-    downloadStart(item.gid, item.token, item.title, "", item.pages, canonical)
+    downloadStart(item.gid, item.token, item.title, "", item.uploader || "", "", "", item.pages, canonical)
       .then(() => {
         setDl("done");
         setTimeout(() => setDl("idle"), 1600);
