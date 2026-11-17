@@ -117,6 +117,7 @@ export function fixtureDownloads(): DownloadItem[] {
       complete: 7,
       dir: "C:\\Downloads\\EhViewer\\1001-示例画廊 2",
       url: "fixture://gallery/1001",
+      thumb: placeholder(`封面1001`, 250, 350),
     },
     {
       gid: 1002,
@@ -128,6 +129,7 @@ export function fixtureDownloads(): DownloadItem[] {
       complete: 0,
       dir: "",
       url: "fixture://gallery/1002",
+      thumb: placeholder(`封面1002`, 250, 350),
     },
     {
       gid: 1003,
@@ -139,6 +141,7 @@ export function fixtureDownloads(): DownloadItem[] {
       complete: 16,
       dir: "C:\\Downloads\\EhViewer\\1003-示例画廊 4",
       url: "fixture://gallery/1003",
+      thumb: placeholder(`封面1003`, 250, 350),
     },
     {
       gid: 1004,
@@ -150,6 +153,7 @@ export function fixtureDownloads(): DownloadItem[] {
       complete: 21,
       dir: "C:\\Downloads\\EhViewer\\1004-示例画廊 5",
       url: "fixture://gallery/1004",
+      thumb: placeholder(`封面1004`, 250, 350),
     },
   ];
 }

@@ -107,9 +107,10 @@ export function downloadStart(
   group: string,
   total: number,
   url: string,
+  thumb: string,
 ): Promise<void> {
-  if (isMock()) return mockToggle(gid, title, "downloading");
-  return invoke("download_start", { gid, token, title, label, artist, language, group, total, url });
+  if (isMock()) return mockToggle(gid, title, "downloading", thumb);
+  return invoke("download_start", { gid, token, title, label, artist, language, group, total, url, thumb });
 }
 
 export type RenameStatus = "renamed" | "skipped" | "failed";
@@ -142,9 +143,9 @@ export const DEFAULT_RENAME_TERMS = [
 ];
 
 /** Recursively scans the download root and returns the rename plan. `preview`
- *  only computes before/after names; `false` performs the actual renames and
- *  removes the renamed galleries from the download queue. The scan root is the
- *  persisted `rename_scan_dir` setting (empty = configured download root). */
+ *  only computes before/after names; `false` renames marked gallery folders.
+ *  Queue records are removed when present; off-queue folders are renamed in
+ *  place. The scan root is `rename_scan_dir` (empty = download root). */
 export function renameGalleryDirs(preview: boolean): Promise<RenameReport> {
   if (isMock()) {
     return Promise.resolve({ entries: [], renamed: 0, skipped: 0, failed: 0 });
@@ -201,7 +202,7 @@ function mockLoad(): DownloadItem[] {
   return mockStore;
 }
 
-async function mockToggle(gid: number, title: string, state: string): Promise<void> {
+async function mockToggle(gid: number, title: string, state: string, thumb = ""): Promise<void> {
   const items = mockLoad();
   const existing = items.find((i) => i.gid === gid);
   if (existing) {
@@ -217,6 +218,7 @@ async function mockToggle(gid: number, title: string, state: string): Promise<vo
       complete: 0,
       dir: "",
       url: "",
+      thumb,
     });
   }
 }
@@ -254,9 +256,11 @@ export function cookieVerify(site: number): Promise<{ ok: boolean; message: stri
   return invoke<{ ok: boolean; message: string }>("cookie_verify", { site });
 }
 
-export function exportData(): Promise<string> {
+export function exportData(includeSensitive = false): Promise<string> {
   if (isMock()) return Promise.resolve(JSON.stringify({ version: 1, mock: true }, null, 2));
-  return invoke<object>("export_data").then((v) => JSON.stringify(v, null, 2));
+  return invoke<object>("export_data", { includeSensitive }).then((v) =>
+    JSON.stringify(v, null, 2),
+  );
 }
 
 export function importData(json: string): Promise<{ importedDownloads: number; importedProgress: number }> {
@@ -269,6 +273,7 @@ export function importData(json: string): Promise<{ importedDownloads: number; i
 
 export function fixtureSettings(): AppSettings {
   return {
+    settings_version: 2,
     site: 0,
     config: {},
     session_cookies: [],
@@ -278,10 +283,13 @@ export function fixtureSettings(): AppSettings {
     reading_direction: "ltr",
     zoom_mode: "fit_width",
     reading_start_position: "resume",
+    reading_vertical_preload: 20,
     download_dir: null,
     download_threads: 3,
     download_always_original: false,
-    download_list_page_size: 12,
+    download_list_page_size: 9,
+    download_show_thumb: false,
+    download_archive_completed: false,
     download_interval_secs: 5,
     rename_filter_terms: [],
     rename_scan_dir: "",

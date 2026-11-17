@@ -353,3 +353,110 @@
 .reader-sentinel {
   height: 1px;
 }
+
+/* --- Reader optimization additions (2026-09) --- */
+.reader {
+  position: relative;
+}
+/* Hide the native vertical scrollbar in vertical mode; scrolling still works
+ * via wheel / drag / keys and the continuous top slider. */
+.reader-vertical {
+  scrollbar-width: none;
+}
+.reader-vertical::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+/* Continuous seek slider (replaces page-index semantics in vertical mode). */
+.reader-slider-cont {
+  flex: 1;
+  min-width: 120px;
+  max-width: 360px;
+}
+/* Immersive toolbar: fade out while idling in fullscreen, back on hover / T. */
+.reader-toolbar {
+  transition: opacity 0.18s ease;
+}
+.reader-toolbar-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+/* Whole-gallery progress label (continuous scroll fraction in vertical). */
+.reader-progress-label {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  font-size: 11px;
+  color: var(--color-text-dim);
+  line-height: 1;
+  pointer-events: none;
+}
+/* Vertical thumbnail quick-jump strip (lazy, collapsible). */
+.reader-thumbstrip {
+  position: absolute;
+  top: 52px;
+  right: 6px;
+  bottom: 14px;
+  width: 100px;
+  z-index: 12;
+  display: flex;
+  flex-direction: column;
+}
+.reader-thumb-toggle {
+  align-self: flex-end;
+  width: 22px;
+  height: 26px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px 6px 0 0;
+  background: rgba(24, 28, 34, 0.85);
+  color: var(--color-text);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+.reader-thumb-list {
+  flex: 1;
+  overflow-y: auto;
+  scrollbar-width: none;
+  background: rgba(24, 28, 34, 0.85);
+  border: 1px solid var(--color-border);
+  border-radius: 0 0 6px 6px;
+  padding: 6px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  align-content: start;
+}
+.reader-thumb-list::-webkit-scrollbar {
+  width: 0;
+  display: none;
+}
+.reader-thumb {
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: #1a1e24;
+  padding: 0;
+  overflow: hidden;
+  position: relative;
+  aspect-ratio: 3 / 4;
+  cursor: pointer;
+}
+.reader-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.reader-thumb span {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-dim);
+  font-size: 10px;
+}
+.reader-thumb-cur {
+  outline: 2px solid var(--color-accent);
+}

@@ -27,6 +27,8 @@ use spider::{gallery_dir_name, gallery_download_path, SpiderInfo, SPIDER_INFO_FI
 pub const EV_DOWNLOAD_CHANGED: &str = "download-changed";
 /// Emitted with `{ gid, complete, total }` on each page finished.
 pub const EV_DOWNLOAD_PROGRESS: &str = "download-progress";
+/// Label used by the optional automatic completed-download archive.
+pub const ARCHIVED_LABEL: &str = "已完成";
 
 /// Shared, mostly-immutable manager handle; individual gallery work is isolated
 /// in `SpiderQueen` tasks so a stop only affects its own gallery.
@@ -102,6 +104,7 @@ impl DownloadManager {
         group: String,
         total: u32,
         url: String,
+        thumb: String,
     ) -> Result<(), String> {
         let rec = DownloadRecord {
             gid,
@@ -111,6 +114,7 @@ impl DownloadManager {
             artist,
             language,
             group,
+            thumb,
             state: DownloadState::Wait.as_i32(),
             total: total.max(1),
             complete: 0,
@@ -177,25 +181,37 @@ impl DownloadManager {
     /// deferred until the active worker finishes to avoid writing to a path
     /// that is being relocated beneath it.
     pub async fn relabel_download(&self, gid: u64, label: &str) -> Result<(), String> {
-        let old = self.db.get_download(gid).map_err(|e| e.to_string())?;
-        self.db
-            .relabel_download(gid, label)
-            .map_err(|e| e.to_string())?;
-        if let Some(rec) = old {
-            let root = self.download_root();
-            let new_dir = gallery_download_path(&root, label, gid, &rec.title);
-            let old_dir = if !rec.dir.is_empty() {
-                PathBuf::from(&rec.dir)
-            } else {
-                gallery_download_path(&root, &rec.label, gid, &rec.title)
-            };
+        let rec = self
+            .db
+            .get_download(gid)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("下载记录不存在: {gid}"))?;
+        let root = self.download_root();
+        let new_dir = gallery_download_path(&root, label, gid, &rec.title);
+        let old_dir = if !rec.dir.is_empty() {
+            PathBuf::from(&rec.dir)
+        } else {
+            gallery_download_path(&root, &rec.label, gid, &rec.title)
+        };
+        let active = DownloadState::from_i32(rec.state) == DownloadState::Download;
+
+        if active {
+            self.db
+                .relabel_download(gid, label)
+                .map_err(|e| e.to_string())?;
             if old_dir != new_dir && old_dir.is_dir() {
-                if DownloadState::from_i32(rec.state) == DownloadState::Download {
-                    self.state.lock().await.pending_moves.insert(gid, new_dir);
-                } else {
-                    self.move_gallery_folder(gid, &old_dir, &new_dir);
-                }
+                self.state.lock().await.pending_moves.insert(gid, new_dir);
             }
+        } else {
+            if old_dir != new_dir
+                && old_dir.is_dir()
+                && !self.move_gallery_folder(gid, &old_dir, &new_dir)
+            {
+                return Err(format!("无法移动下载目录: {}", old_dir.display()));
+            }
+            self.db
+                .relabel_download(gid, label)
+                .map_err(|e| e.to_string())?;
         }
         self.emit_changed();
         Ok(())
@@ -207,17 +223,28 @@ impl DownloadManager {
         Ok(recs.iter().map(DownloadDto::from).collect())
     }
 
-    /// Recursively scans the download root for `<gid>-<title>` gallery folders and
-    /// renames them to `[Author] Title`, removing each renamed gallery from the
-    /// download queue (files stay on disk). `preview = true` computes the plan in
-    /// memory without touching the filesystem or the database, so the UI can show
-    /// before/after names and the user can cancel with zero side effects.
-    /// Scans the configured scan root (the fixed `rename_scan_dir` setting, or
-    /// the download root when empty) for `<gid>-<title>` gallery folders and
-    /// renames them to `[Author] Title`, removing each renamed gallery from the
-    /// download queue (files stay on disk). Only folders that actually contain
-    /// the `.ehviewer` marker are touched, so nothing outside the scan root is
-    /// ever renamed.
+    /// Archives every finished item still in the default label. Safe to call
+    /// repeatedly: already-archived and non-default records are ignored.
+    pub async fn archive_completed_defaults(&self) -> Result<usize, String> {
+        if !self.archive_completed_enabled() {
+            return Ok(0);
+        }
+        let recs = self.db.list_downloads().map_err(|e| e.to_string())?;
+        let mut archived = 0usize;
+        for rec in recs.iter().filter(|r| should_archive_completed(r)) {
+            match self.relabel_download(rec.gid, ARCHIVED_LABEL).await {
+                Ok(()) => archived += 1,
+                Err(e) => log::warn!("failed to archive download {}: {}", rec.gid, e),
+            }
+        }
+        Ok(archived)
+    }
+
+    /// Recursively scans the configured root for marked `<gid>-<title>` folders
+    /// and renames them to `[Author] Title`. Queued galleries use DB metadata and
+    /// are removed from the queue after success; off-queue galleries use their
+    /// folder title and are renamed in place. Files always stay on disk.
+    /// `preview = true` performs no filesystem or database writes.
     pub async fn rename_dirs(&self, preview: bool) -> Result<naming::RenameReport, String> {
         let mut report = naming::RenameReport::default();
         let root = self.rename_scan_root();
@@ -282,13 +309,22 @@ impl DownloadManager {
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
                 .to_string();
-            if let Some((gid, _)) = naming::parse_old_folder_name(&name) {
+            if let Some((gid, folder_title)) = naming::parse_old_folder_name(&name) {
                 // A folder is only a renameable gallery if it carries the
                 // `.ehviewer` index; anything else with a gid-like name is left
                 // strictly untouched (and not recursed into) so renames never
                 // spill into unrelated directories.
                 if p.join(SPIDER_INFO_FILENAME).is_file() {
-                    self.rename_one(&p, gid, by_gid, terms, used, report, preview);
+                    self.rename_one(
+                        &p,
+                        gid,
+                        folder_title,
+                        by_gid,
+                        terms,
+                        used,
+                        report,
+                        preview,
+                    );
                 }
             } else {
                 self.scan_for_rename(&p, by_gid, terms, used, report, preview);
@@ -300,6 +336,7 @@ impl DownloadManager {
         &self,
         p: &Path,
         gid: u64,
+        folder_title: &str,
         by_gid: &HashMap<u64, &DownloadRecord>,
         terms: &[String],
         used: &mut HashSet<String>,
@@ -310,20 +347,18 @@ impl DownloadManager {
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let Some(&rec) = by_gid.get(&gid) else {
-            self.push_report(report, gid, old_name, String::new(), "skipped", Some("不在下载队列"));
-            return;
-        };
-        if matches!(
-            DownloadState::from_i32(rec.state),
-            DownloadState::Wait | DownloadState::Download
-        ) {
-            self.push_report(report, gid, old_name, String::new(), "skipped", Some("下载中，跳过"));
-            return;
+        let rec = by_gid.get(&gid).copied();
+        if let Some(rec) = rec {
+            if matches!(
+                DownloadState::from_i32(rec.state),
+                DownloadState::Wait | DownloadState::Download
+            ) {
+                self.push_report(report, gid, old_name, String::new(), "skipped", Some("下载中，跳过"));
+                return;
+            }
         }
-        let artist = opt_str(rec.artist.as_str());
-        let language = opt_str(rec.language.as_str());
-        match naming::plan_rename(&rec.title, artist, language, terms) {
+        let (title, artist, language) = rename_source(folder_title, rec);
+        match naming::plan_rename(title, artist, language, terms) {
             Err(skip) => {
                 self.push_report(
                     report,
@@ -349,8 +384,10 @@ impl DownloadManager {
                     let new_path = parent.join(&candidate);
                     match std::fs::rename(p, &new_path) {
                         Ok(()) => {
-                            let _ = self.db.set_download_dir(gid, &new_path.to_string_lossy());
-                            let _ = self.db.delete_download(gid);
+                            if rec.is_some() {
+                                let _ = self.db.set_download_dir(gid, &new_path.to_string_lossy());
+                                let _ = self.db.delete_download(gid);
+                            }
                             self.push_report(report, gid, old_name, candidate, "renamed", None);
                         }
                         Err(e) => self.push_report(
@@ -505,6 +542,17 @@ impl DownloadManager {
                 let _ = info.write(&dir.join(SPIDER_INFO_FILENAME));
                 let _ = self.db.set_download_progress(gid, complete);
                 let _ = self.db.set_download_state(gid, DownloadState::Finish.as_i32());
+                let archive_on_finish = self
+                    .db
+                    .get_download(gid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|r| should_archive_completed(&r));
+                if self.archive_completed_enabled() && archive_on_finish {
+                    if let Err(e) = self.relabel_download(gid, ARCHIVED_LABEL).await {
+                        log::warn!("failed to archive completed download {}: {}", gid, e);
+                    }
+                }
                 GalleryOutcome::Done
             }
             QueenResult::Cancelled { complete } => {
@@ -561,6 +609,11 @@ impl DownloadManager {
         }
         if any {
             self.notify.notify_one();
+        }
+        if self.archive_completed_enabled() {
+            if let Err(e) = self.archive_completed_defaults().await {
+                log::warn!("failed to migrate completed downloads to archive: {}", e);
+            }
         }
         self.emit_changed();
     }
@@ -627,6 +680,10 @@ impl DownloadManager {
         } else {
             std::env::temp_dir().join("ehviewer")
         }
+    }
+
+    fn archive_completed_enabled(&self) -> bool {
+        self.settings.lock().unwrap().download_archive_completed
     }
 
     fn site(&self) -> u8 {
@@ -704,6 +761,24 @@ fn opt_str(s: &str) -> Option<&str> {
     }
 }
 
+fn rename_source<'a>(
+    folder_title: &'a str,
+    rec: Option<&'a DownloadRecord>,
+) -> (&'a str, Option<&'a str>, Option<&'a str>) {
+    match rec {
+        Some(rec) => (
+            rec.title.as_str(),
+            opt_str(rec.artist.as_str()),
+            opt_str(rec.language.as_str()),
+        ),
+        None => (folder_title, None, None),
+    }
+}
+
+fn should_archive_completed(rec: &DownloadRecord) -> bool {
+    DownloadState::from_i32(rec.state) == DownloadState::Finish && rec.label.trim().is_empty()
+}
+
 /// Moves the gallery folder `old` -> `new` (creating `new`'s parent) and, on
 /// success, updates the stored download `dir`. Must be called while the gallery
 /// is not being written to, to avoid racing the active spider.
@@ -744,6 +819,62 @@ mod tests {
     }
 
     #[test]
+    fn completed_defaults_are_archive_candidates() {
+        let mut rec = DownloadRecord {
+            gid: 1,
+            token: String::new(),
+            title: "Gal".into(),
+            label: String::new(),
+            artist: String::new(),
+            language: String::new(),
+            group: String::new(),
+            thumb: String::new(),
+            state: DownloadState::Finish.as_i32(),
+            total: 1,
+            complete: 1,
+            dir: String::new(),
+            url: String::new(),
+        };
+        assert!(should_archive_completed(&rec));
+        rec.label = "  ".into();
+        assert!(should_archive_completed(&rec));
+        rec.label = "收藏".into();
+        assert!(!should_archive_completed(&rec));
+        rec.label.clear();
+        rec.state = DownloadState::Wait.as_i32();
+        assert!(!should_archive_completed(&rec));
+    }
+
+    #[test]
+    fn offqueue_rename_uses_folder_title() {
+        let title = "[Author] Folder Title";
+        let (resolved, artist, language) = rename_source(title, None);
+        assert_eq!(resolved, title);
+        assert!(artist.is_none());
+        assert!(language.is_none());
+
+        let rec = DownloadRecord {
+            gid: 1,
+            token: String::new(),
+            title: "DB Title".into(),
+            label: String::new(),
+            artist: "DB Artist".into(),
+            language: "chinese".into(),
+            group: String::new(),
+            thumb: String::new(),
+            state: DownloadState::Finish.as_i32(),
+            total: 1,
+            complete: 1,
+            dir: String::new(),
+            url: String::new(),
+        };
+        let (resolved, artist, language) = rename_source(title, Some(&rec));
+        assert_eq!(resolved, "DB Title");
+        assert_eq!(artist, Some("DB Artist"));
+        assert_eq!(language, Some("chinese"));
+    }
+
+    #[test]
     fn flat_detection() {
         let root = Path::new("R");
         assert!(is_flat_under(root, &root.join("1-Gal")));
@@ -764,6 +895,7 @@ mod tests {
             artist: String::new(),
             language: String::new(),
             group: String::new(),
+            thumb: String::new(),
             state: DownloadState::Finish.as_i32(),
             total: 10,
             complete: 10,

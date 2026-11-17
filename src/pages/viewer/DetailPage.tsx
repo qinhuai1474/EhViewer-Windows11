@@ -60,6 +60,7 @@ export function DetailPage({ item, onBack, onPreviews, onRead }: Props) {
       groupFrom,
       d.pages,
       galleryUrl,
+      d.thumb || "",
     )
       .then(() => setDlMsg("已加入下载队列"))
       .catch((e) => setDlMsg("下载失败：" + String(e)));

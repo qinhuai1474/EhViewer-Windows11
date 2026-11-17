@@ -42,3 +42,10 @@ settings.json
 *.p12
 *.key
 .env
+.env*
+.npmrc
+.cargo/
+*.secret
+*.token
+*credential*
+dist-source/

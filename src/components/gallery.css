@@ -145,3 +145,62 @@
 .gcard-dl--queued {
   background: var(--color-accent);
 }
+
+/* -- gallery quick-download remove confirm (DlConfirm) -- */
+.gdl-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.gdl-modal {
+  width: 320px;
+  max-width: calc(100vw - 40px);
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+.gdl-modal-title {
+  font-weight: 600;
+}
+.gdl-hint {
+  color: var(--color-text-dim);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0;
+}
+.gdl-delete-erase label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.gdl-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.gdl-actions button {
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--color-border);
+  background: var(--color-hover);
+  cursor: pointer;
+}
+.gdl-actions .gdl-confirm {
+  background: #c62828;
+  border-color: #c62828;
+  color: #fff;
+}
+.gcard-dl--queued:hover {
+  background: #b3373a;
+}

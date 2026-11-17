@@ -62,6 +62,7 @@ export interface DownloadItem {
   complete: number;
   dir: string;
   url: string;
+  thumb: string;
 }
 
 export interface DownloadProgress {
@@ -77,6 +78,7 @@ export interface CookiePair {
 }
 
 export interface AppSettings {
+  settings_version: number;
   site: number;
   config: Record<string, unknown>;
   session_cookies: CookiePair[];
@@ -86,10 +88,13 @@ export interface AppSettings {
   reading_direction: string;
   zoom_mode: string;
   reading_start_position: string;
+  reading_vertical_preload: number;
   download_dir: string | null;
   download_threads: number;
   download_always_original: boolean;
   download_list_page_size: number;
+  download_show_thumb: boolean;
+  download_archive_completed: boolean;
   download_interval_secs: number;
   rename_filter_terms: string[];
   rename_scan_dir: string;

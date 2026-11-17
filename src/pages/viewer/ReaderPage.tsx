@@ -33,10 +33,14 @@ const STATUS_TEXT: Record<string, string> = {
 
 // ----- Phase 2 memory bounds -----
 const MAX_PAGER_PAGES = 60; // single-page (ltr / rtl) image ceiling
-const VERT_BEHIND = 30; // vertical pages kept behind the current one
-const VERT_AHEAD = 20; // vertical pages prefetched ahead of the current one
+const VERT_BEHIND = 30; // vertical pages kept behind the current one (fixed)
+const VERT_AHEAD_DEFAULT = 20; // default ahead-prefetch window (vertical + pager)
+const VERT_AHEAD_MAX = 20; // user-customisable ceiling for ahead-prefetch
+const MAX_RETRY = 3; // automatic per-page load attempts before marking failed
 const CLICK_DRAG_THRESHOLD = 8; // px of pointer travel that counts as a drag
 const DOUBLE_TAP_MS = 350; // double-click / double-tap window
+
+const ADJ_STORAGE_KEY = (gid: number) => `ehReaderAdj:${gid}`;
 
 function isDirection(v: string): v is Direction {
   return v === "ltr" || v === "rtl" || v === "vertical";
@@ -98,8 +102,17 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
   const scrollRaf = useRef<number | null>(null);
   const loadedRef = useRef<Set<number>>(new Set());
   const failedRef = useRef<Set<number>>(new Set());
+  const isSeekingRef = useRef(false);
+  const attemptRef = useRef<Record<number, number>>({});
+  const idleTimerRef = useRef<number | null>(null);
+  const pagerPrefetchRef = useRef(false);
   const [failed, setFailed] = useState<Set<number>>(new Set());
   const [progress, setProgress] = useState<Record<number, number>>({});
+  const [forwardPreload, setForwardPreload] = useState(VERT_AHEAD_DEFAULT);
+  const [norm, setNorm] = useState(0); // vertical scroll fraction 0..1 (slider + progress bar)
+  const [thumbOpen, setThumbOpen] = useState(false);
+  const [barHidden, setBarHidden] = useState(false);
+  const [adjMap, setAdjMap] = useState<Record<number, { rot: number; flip: boolean }>>({});
 
   const verticalRef = useRef(false);
   const indexRef = useRef(index);
@@ -132,6 +145,14 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
         if (!alive) return;
         if (isDirection(s.reading_direction)) setDirection(s.reading_direction);
         if (isZoom(s.zoom_mode)) setZoom(s.zoom_mode);
+        const pre = typeof s.reading_vertical_preload === "number" ? s.reading_vertical_preload : VERT_AHEAD_DEFAULT;
+        setForwardPreload(Math.max(0, Math.min(VERT_AHEAD_MAX, Math.round(pre))));
+        try {
+          const raw = localStorage.getItem(ADJ_STORAGE_KEY(item.gid));
+          if (raw) setAdjMap((JSON.parse(raw) as Record<number, { rot: number; flip: boolean }>) ?? {});
+        } catch {
+          /* ignore corrupt rotation value */
+        }
         setPrefs({ loaded: true, first: s.reading_start_position === "first" });
       })
       .catch(() => {
@@ -166,10 +187,22 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
       if (jobs.length === 0) return;
 
       for (const i of jobs) {
-        try {
-          const page = await getOnlinePage(0, item.gid, item.token, i, "");
-          if (page.imageUrl) {
-            const src = await remoteImage(page.imageUrl, (p) =>
+        let done = false;
+        // Automatic retry: attempt up to MAX_RETRY times per page; on the final
+        // attempt fall back to the original full-res link when it is available.
+        for (let attempt = 0; attempt < MAX_RETRY && !done; attempt++) {
+          attemptRef.current[i] = (attemptRef.current[i] ?? 0) + 1;
+          let page: { imageUrl: string; originImageUrl?: string | null } | null = null;
+          try {
+            page = await getOnlinePage(0, item.gid, item.token, i, "");
+          } catch {
+            page = null;
+          }
+          const url = page?.imageUrl;
+          if (!url) continue;
+          const target = attempt === MAX_RETRY - 1 && page?.originImageUrl ? page.originImageUrl : url;
+          try {
+            const src = await remoteImage(target, (p) =>
               setProgress((prev) => (prev[i] === p ? prev : { ...prev, [i]: p })),
             );
             setProgress((prev) => {
@@ -182,22 +215,18 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
               loadedRef.current.add(i);
               failedRef.current.delete(i);
               setImages((prev) => (prev[i] ? prev : { ...prev, [i]: src }));
-            } else {
-              failedRef.current.add(i);
+              done = true;
             }
-          } else {
-            failedRef.current.add(i);
+          } catch {
+            setProgress((prev) => {
+              if (!(i in prev)) return prev;
+              const next = { ...prev };
+              delete next[i];
+              return next;
+            });
           }
-        } catch {
-          setProgress((prev) => {
-            if (!(i in prev)) return prev;
-            const next = { ...prev };
-            delete next[i];
-            return next;
-          });
-          // Record the failure so the UI shows a retryable error state.
-          failedRef.current.add(i);
         }
+        if (!done) failedRef.current.add(i);
       }
       setFailed(new Set(failedRef.current));
       // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -209,6 +238,7 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
     failedRef.current.clear();
     setFailed(new Set());
     setProgress({});
+    attemptRef.current = {};
     loadedRef.current.clear();
     setImages({});
     loadRange(index);
@@ -239,15 +269,44 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
     [item.pages, direction, scrollToIndex],
   );
 
+  // Per-page orientation correction (rotate / mirror), persisted to localStorage.
+  const rotateCurrent = useCallback((d: 90 | -90 | 180) => {
+    setAdjMap((prev) => {
+      const c = prev[index] ?? { rot: 0, flip: false };
+      return { ...prev, [index]: { rot: (c.rot + d + 360) % 360, flip: c.flip } };
+    });
+  }, [index]);
+  const flipCurrent = useCallback(() => {
+    setAdjMap((prev) => {
+      const c = prev[index] ?? { rot: 0, flip: false };
+      return { ...prev, [index]: { rot: c.rot, flip: !c.flip } };
+    });
+  }, [index]);
+
+  // Continuous seek: write a scroll fraction (0..1) directly to the viewport.
+  const applyNorm = useCallback((k: number) => {
+    const el = listRef.current;
+    if (!el) return;
+    const maxScroll = el.scrollHeight - el.clientHeight;
+    if (maxScroll > 0) el.scrollTop = Math.min(maxScroll, Math.max(0, k * maxScroll));
+  }, []);
+
   // Keyboard navigation.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Never intercept while the user is interacting with a form control.
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA")) return;
       switch (e.key) {
         case "ArrowRight":
+        case "d":
+        case "D":
           if (direction === "rtl") goto(index - 1);
           else if (direction !== "vertical") goto(index + 1);
           break;
         case "ArrowLeft":
+        case "a":
+        case "A":
           if (direction === "rtl") goto(index + 1);
           else if (direction !== "vertical") goto(index - 1);
           break;
@@ -266,6 +325,24 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
             goto(index - 1);
           }
           break;
+        case "[":
+          rotateCurrent(-90);
+          break;
+        case "]":
+          rotateCurrent(90);
+          break;
+        case "0":
+          rotateCurrent(180);
+          break;
+        case "\\":
+          flipCurrent();
+          break;
+        case "t":
+        case "T":
+          setBarHidden((h) => !h);
+          if (idleTimerRef.current != null) clearTimeout(idleTimerRef.current);
+          idleTimerRef.current = null;
+          break;
         case "f":
         case "F":
           toggleFs();
@@ -274,7 +351,7 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [direction, index, goto, toggleFs]);
+  }, [direction, index, goto, toggleFs, rotateCurrent, flipCurrent]);
 
   // Vertical scroll: keep current page, progress and prefetch synced to the page
   // nearest the viewport centre (rAF-throttled, pager modes are skipped).
@@ -299,8 +376,57 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
         }
       }
       if (best >= 0) setIndex((cur) => (cur === best ? cur : best));
+      if (!isSeekingRef.current) {
+        const maxScroll = el.scrollHeight - el.clientHeight;
+        const n = maxScroll > 0 ? Math.min(1, Math.max(0, el.scrollTop / maxScroll)) : 0;
+        setNorm(n);
+      }
     });
   }, []);
+
+  // Sync the shared scroll fraction when (re)entering vertical mode.
+  useEffect(() => {
+    if (!verticalRef.current) return;
+    const el = listRef.current;
+    if (el) {
+      const maxScroll = el.scrollHeight - el.clientHeight;
+      const n = maxScroll > 0 ? Math.min(1, Math.max(0, el.scrollTop / maxScroll)) : 0;
+      setNorm(n);
+    }
+  }, [direction]);
+
+  // Persist per-page orientation corrections for this gallery.
+  useEffect(() => {
+    if (!Object.keys(adjMap).length) return;
+    try {
+      localStorage.setItem(ADJ_STORAGE_KEY(item.gid), JSON.stringify(adjMap));
+    } catch {
+      /* ignore quota / storage errors */
+    }
+  }, [adjMap, item.gid]);
+
+  // Immersive toolbar: fade the bar out after 1s of idle in vertical fullscreen;
+  // pointer / wheel activity (or the T key) brings it back.
+  useEffect(() => {
+    if (!verticalRef.current) return;
+    const reveal = () => {
+      setBarHidden(false);
+      if (idleTimerRef.current != null) clearTimeout(idleTimerRef.current);
+      if (document.fullscreenElement) {
+        idleTimerRef.current = window.setTimeout(() => setBarHidden(true), 1000);
+      } else {
+        idleTimerRef.current = null;
+      }
+    };
+    window.addEventListener("pointermove", reveal);
+    window.addEventListener("wheel", reveal);
+    reveal();
+    return () => {
+      if (idleTimerRef.current != null) clearTimeout(idleTimerRef.current);
+      window.removeEventListener("pointermove", reveal);
+      window.removeEventListener("wheel", reveal);
+    };
+  }, [direction]);
 
   const onWheel = useCallback((e: React.WheelEvent) => {
     if (!e.ctrlKey) return;
@@ -410,7 +536,7 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
     const loadedIdx = Object.keys(images).map(Number);
     const maxLoaded = loadedIdx.length ? Math.max(...loadedIdx) : index;
     const lo = Math.max(0, index - VERT_BEHIND);
-    const hi = Math.min(item.pages - 1, Math.max(index + VERT_AHEAD, maxLoaded + 7));
+    const hi = Math.min(item.pages - 1, Math.max(index + forwardPreload, maxLoaded + 7));
     const out: { i: number; state: "loaded" | "failed" | "loading" }[] = [];
     for (let i = lo; i <= hi; i++) {
       const state = images[i] !== undefined ? "loaded" : failed.has(i) ? "failed" : "loading";
@@ -426,10 +552,10 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
       const loadedIdx = Object.keys(images).map(Number);
       // Act as a memory guard: only prune once the window has grown well past
       // its target size, so normal/asymptotic reading never shifts the layout.
-      if (loadedIdx.length <= VERT_BEHIND + VERT_AHEAD + 24) return;
+      if (loadedIdx.length <= VERT_BEHIND + forwardPreload + 24) return;
       const maxLoaded = loadedIdx.length ? Math.max(...loadedIdx) : index;
       const lo = Math.max(0, index - VERT_BEHIND);
-      const hi = Math.min(item.pages - 1, Math.max(index + VERT_AHEAD, maxLoaded + 7));
+      const hi = Math.min(item.pages - 1, Math.max(index + forwardPreload, maxLoaded + 7));
       setImages((prev) => {
         let changed = false;
         const next: Record<number, string> = {};
@@ -451,7 +577,7 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
         return next;
       });
     }
-  }, [item.pages, index, images]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [item.pages, index, images, forwardPreload]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Drop `loadedRef` entries whose image was evicted so a revisit re-fetches.
   useEffect(() => {
@@ -474,12 +600,36 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
     const el = listRef.current;
     if (!sentinel || !el) return;
     const io = new IntersectionObserver(
-      () => loadRange(Math.max(0, indexRef.current + VERT_AHEAD - 2)),
+      () => loadRange(Math.max(0, indexRef.current + forwardPreload - 2)),
       { root: el, rootMargin: "600px 0px" },
     );
     io.observe(sentinel);
     return () => io.disconnect();
-  }, [loadRange, item.pages, vertical]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [loadRange, item.pages, vertical, forwardPreload]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Pager (ltr/rtl) forward prefetch: keep a warm run of pages ahead of the
+  // current one using the same shared `forwardPreload` budget as vertical, so
+  // turning pages stays smooth. Self-limits to the loaded head.
+  useEffect(() => {
+    if (verticalRef.current || pagerPrefetchRef.current) return;
+    let head = index;
+    for (const v of loadedRef.current) if (v > head) head = v;
+    // Let the index-following load do its job first; prefetch the next budget
+    // only once the current page has caught up to the loaded head.
+    if (head - index >= 1) return;
+    const from = index + 1;
+    const to = Math.min(item.pages - 1, index + forwardPreload + 2);
+    pagerPrefetchRef.current = true;
+    (async () => {
+      try {
+        for (let c = from; c <= to; c += 3) {
+          await loadRange(c);
+        }
+      } finally {
+        pagerPrefetchRef.current = false;
+      }
+    })();
+  }, [index, item.pages, forwardPreload, loadRange]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function imgStyleFor(zoomMode: Zoom): React.CSSProperties {
     switch (zoomMode) {
@@ -496,19 +646,44 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
     }
   }
 
+  // Merge per-page orientation correction (rotate / mirror) into image styles.
+  function adjStyleFor(adj: { rot: number; flip: boolean } | undefined): React.CSSProperties {
+    if (!adj || (!adj.rot && !adj.flip)) return {};
+    return { transform: `rotate(${adj.rot}deg)${adj.flip ? " scaleX(-1)" : ""}`, transformOrigin: "center" };
+  }
+
   return (
     <div className={fullscreen ? "reader reader-fullscreen" : "reader"}>
-      <div className="reader-toolbar">
+      <div
+        className={"reader-toolbar" + (barHidden ? " reader-toolbar-hidden" : "")}
+        onMouseEnter={() => setBarHidden(false)}
+      >
         <button onClick={onBack}>← 退出</button>
         <b>{index + 1} / {item.pages}</b>
         <input
-          className="reader-slider"
+          className={"reader-slider" + (vertical ? " reader-slider-cont" : "")}
           type="range"
           min={0}
-          max={Math.max(0, item.pages - 1)}
-          value={index}
-          onChange={(e) => goto(Number(e.currentTarget.value))}
-          aria-label="跳转页码"
+          max={vertical ? 1000 : Math.max(0, item.pages - 1)}
+          value={vertical ? Math.round(norm * 1000) : index}
+          onInput={(e) => {
+            const v = Number(e.currentTarget.value);
+            if (vertical) {
+              isSeekingRef.current = true;
+              const k = Math.min(1, Math.max(0, v / 1000));
+              setNorm(k);
+              applyNorm(k);
+            } else {
+              goto(v);
+            }
+          }}
+          onPointerUp={() => {
+            isSeekingRef.current = false;
+          }}
+          onPointerCancel={() => {
+            isSeekingRef.current = false;
+          }}
+          aria-label={vertical ? "连续定位" : "跳转页码"}
         />
         <select value={direction} onChange={onDirectionChange}>
           {Object.entries(PORTS).map(([v, l]) => (
@@ -559,7 +734,7 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
                   src={images[i]}
                   alt={`第 ${i + 1} 页`}
                   className="reader-img-v"
-                  style={imgStyleFor(zoom)}
+                  style={{ ...imgStyleFor(zoom), ...adjStyleFor(adjMap[i]) }}
                 />
               ) : state === "failed" ? (
                 <div key={i} data-index={i} className="reader-fail-block">
@@ -579,7 +754,7 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
             <div ref={sentinelRef} className="reader-sentinel" aria-hidden="true" />
           </>
         ) : contentImg ? (
-          <img src={contentImg} alt={`第 ${index + 1} 页`} className="reader-img" style={imgStyleFor(zoom)} />
+          <img src={contentImg} alt={`第 ${index + 1} 页`} className="reader-img" style={{ ...imgStyleFor(zoom), ...adjStyleFor(adjMap[index]) }} />
         ) : failed.has(index) ? (
           <div className="reader-fail">
             <p>图片加载失败（该页可能受限或网络异常）</p>
@@ -589,8 +764,37 @@ export function ReaderPage({ item, startIndex = 0, onBack }: Props) {
           <LoadingIndicator className="reader-loading" percent={progress[index]} />
         )}
       </div>
+      {vertical && (
+        <div className="reader-thumbstrip">
+          <button
+            className="reader-thumb-toggle"
+            onClick={() => setThumbOpen((o) => !o)}
+            title={thumbOpen ? "收起缩略图" : "展开缩略图"}
+          >
+            {thumbOpen ? "›" : "‹"}
+          </button>
+          {thumbOpen && (
+            <div className="reader-thumb-list">
+              {Array.from({ length: item.pages }, (_, i) => (
+                <button
+                  key={i}
+                  className={"reader-thumb" + (i === index ? " reader-thumb-cur" : "")}
+                  title={`第 ${i + 1} 页`}
+                  onMouseEnter={() => {
+                    if (!images[i] && !failed.has(i)) loadRange(i);
+                  }}
+                  onClick={() => goto(i)}
+                >
+                  {images[i] ? <img src={images[i]} alt="" loading="lazy" /> : <span>{i + 1}</span>}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
       <div className="reader-progress">
-        <div style={{ width: `${((index + 1) / item.pages) * 100}%` }} />
+        <div style={{ width: `${(vertical ? norm : (index + 1) / item.pages) * 100}%` }} />
+        {vertical && <span className="reader-progress-label">{Math.round(norm * 100)}%</span>}
       </div>
     </div>
   );

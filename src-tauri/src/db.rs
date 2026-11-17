@@ -37,6 +37,7 @@ pub struct DownloadRecord {
     pub artist: String,
     pub language: String,
     pub group: String,
+    pub thumb: String,
     pub state: i32,
     pub total: u32,
     pub complete: u32,
@@ -54,6 +55,7 @@ pub struct DownloadDto {
     pub artist: String,
     pub language: String,
     pub group: String,
+    pub thumb: String,
     pub state: String,
     pub total: u32,
     pub complete: u32,
@@ -71,6 +73,7 @@ impl From<&DownloadRecord> for DownloadDto {
             artist: rec.artist.clone(),
             language: rec.language.clone(),
             group: rec.group.clone(),
+            thumb: rec.thumb.clone(),
             state: DownloadState::from_i32(rec.state).as_str().to_string(),
             total: rec.total,
             complete: rec.complete,
@@ -145,6 +148,7 @@ impl Db {
             ("artist", "TEXT NOT NULL DEFAULT ''"),
             ("language", "TEXT NOT NULL DEFAULT ''"),
             ("circle", "TEXT NOT NULL DEFAULT ''"),
+            ("thumb", "TEXT NOT NULL DEFAULT ''"),
         ] {
             let exists = conn
                 .prepare(&format!(
@@ -165,12 +169,13 @@ impl Db {
     pub fn upsert_download(&self, rec: &DownloadRecord) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO downloads(gid,token,title,label,artist,language,circle,state,total,complete,dir,url)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'','')
+            "INSERT INTO downloads(gid,token,title,label,artist,language,circle,state,total,complete,dir,url,thumb)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'','',?11)
              ON CONFLICT(gid) DO UPDATE SET
                token=excluded.token, title=excluded.title, label=excluded.label,
                artist=excluded.artist, language=excluded.language, circle=excluded.circle,
-               state=excluded.state, total=excluded.total, complete=excluded.complete",
+               state=excluded.state, total=excluded.total, complete=excluded.complete,
+               thumb=excluded.thumb",
             rusqlite::params![
                 rec.gid,
                 rec.token,
@@ -181,7 +186,8 @@ impl Db {
                 rec.group,
                 rec.state,
                 rec.total,
-                rec.complete
+                rec.complete,
+                rec.thumb
             ],
         )?;
         Ok(())
@@ -190,7 +196,7 @@ impl Db {
     pub fn list_downloads(&self) -> rusqlite::Result<Vec<DownloadRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT gid,token,title,label,artist,language,circle,state,total,complete,dir,url FROM downloads ORDER BY gid",
+            "SELECT gid,token,title,label,artist,language,circle,state,total,complete,dir,url,thumb FROM downloads ORDER BY gid",
         )?;
         let rows = stmt
             .query_map([], map_record)?
@@ -201,7 +207,7 @@ impl Db {
     pub fn get_download(&self, gid: u64) -> rusqlite::Result<Option<DownloadRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT gid,token,title,label,artist,language,circle,state,total,complete,dir,url FROM downloads WHERE gid=?1")
+            .prepare("SELECT gid,token,title,label,artist,language,circle,state,total,complete,dir,url,thumb FROM downloads WHERE gid=?1")
             .unwrap();
         let mut rows = stmt.query_map([gid], map_record)?;
         rows.next().transpose()
@@ -304,6 +310,7 @@ fn map_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadRecord> {
         artist: r.get(4)?,
         language: r.get(5)?,
         group: r.get(6)?,
+        thumb: r.get(12)?,
         state: r.get(7)?,
         total: r.get(8)?,
         complete: r.get(9)?,

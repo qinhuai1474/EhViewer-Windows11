@@ -1,11 +1,11 @@
 //! Gallery folder renaming pipeline: `<gid>-<sanitized title>` -> `[Author] Title`.
 //!
-//! The rename is derived from the single source of truth (`title`, stored with
-//! brackets intact) plus metadata captured at download time (`artist`, `group`,
-//! `language`). A configurable blocklist strips useless tags (language /
-//! translator / AI / Patreon / Pixiv / Unifans...) and leters remain as the work
-//! name. Author resolution: leading `[....]` bracket -> metadata `artist` ->
-//! metadata `group` -> `uploader` (already folded into `artist` at capture).
+//! Queued galleries use the stored title plus metadata captured at download time
+//! (`artist`, `group`, `language`). Off-queue folders fall back to the title from
+//! their own `gid-<title>` basename. A configurable blocklist strips useless tags
+//! (language / translator / AI / Patreon / Pixiv / Unifans...) and letters remain
+//! as the work name. Author resolution: leading `[....]` bracket -> metadata
+//! `artist` -> metadata `group` -> `uploader` (already folded into `artist`).
 
 use std::fmt;
 

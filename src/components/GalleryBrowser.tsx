@@ -247,6 +247,14 @@ export function GalleryBrowser({ showSearch, onOpen }: Props) {
     saveHistory([]);
   };
 
+  const removeHistory = (entry: string) => {
+    setHistory((prev) => {
+      const next = prev.filter((x) => x !== entry);
+      saveHistory(next);
+      return next;
+    });
+  };
+
   const applyHistory = (k: string) => {
     restoreModeRef.current = false;
     setHistoryOpen(false);
@@ -260,6 +268,12 @@ export function GalleryBrowser({ showSearch, onOpen }: Props) {
     restoreModeRef.current = false;
     addHistory(keyword);
     load(0);
+  };
+  const refreshPopular = () => {
+    restoreModeRef.current = false;
+    scrollRef.current = 0;
+    setContentY(0);
+    void load(0);
   };
   const toggleExcluded = (bit: number) => {
     restoreModeRef.current = false;
@@ -304,13 +318,22 @@ export function GalleryBrowser({ showSearch, onOpen }: Props) {
                 </div>
                 <ul>
                   {history.map((h) => (
-                    <li key={h}>
+                    <li key={h} className="history-row">
                       <button
                         type="button"
                         className="history-item"
                         onClick={() => applyHistory(h)}
                       >
                         {h}
+                      </button>
+                      <button
+                        type="button"
+                        className="history-remove"
+                        aria-label={`删除搜索记录 ${h}`}
+                        title="删除该记录"
+                        onClick={() => removeHistory(h)}
+                      >
+                        ×
                       </button>
                     </li>
                   ))}
@@ -375,6 +398,19 @@ export function GalleryBrowser({ showSearch, onOpen }: Props) {
           <GalleryGrid items={data.items} onOpen={(it) => onOpen?.(it)} downloadedGids={downloaded} />
           <Pagination nav={data.nav} page={page} onPage={load} onHref={gotoHref} />
         </>
+      )}
+      {!showSearch && (
+        <button
+          type="button"
+          className="browser-refresh"
+          onClick={refreshPopular}
+          disabled={loading}
+          aria-label="刷新热门画廊并返回第一页"
+          title="刷新并返回第一页"
+        >
+          <span aria-hidden="true">↻</span>
+          刷新
+        </button>
       )}
     </div>
   );

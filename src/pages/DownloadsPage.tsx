@@ -7,11 +7,14 @@ import {
   downloadStop,
   onDownloadChanged,
   onDownloadProgress,
+  settingsGet,
 } from "../lib/api";
+import type { GalleryItem } from "../types";
 import type { DownloadItem } from "../lib/types";
+import { RemoteImg } from "../components/RemoteImg";
 import "./downloads.css";
 
-const PAGE_SIZE = 12;
+const DEFAULT_PAGE_SIZE = 9;
 const DEFAULT_LABEL = "默认";
 
 const STATE_TEXT: Record<string, string> = {
@@ -22,7 +25,7 @@ const STATE_TEXT: Record<string, string> = {
   failed: "失败",
 };
 
-export function DownloadsPage() {
+export function DownloadsPage({ onOpen }: { onOpen?: (item: GalleryItem) => void }) {
   const [items, setItems] = useState<DownloadItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -34,6 +37,21 @@ export function DownloadsPage() {
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [relabelFor, setRelabelFor] = useState<number[] | null>(null);
   const [deleteFor, setDeleteFor] = useState<number[] | null>(null);
+  const [showThumb, setShowThumb] = useState(false);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+
+  useEffect(() => {
+    settingsGet()
+      .then((s) => {
+        setShowThumb(!!s.download_show_thumb);
+        setPageSize(
+          Number.isFinite(s.download_list_page_size) && s.download_list_page_size > 0
+            ? Math.max(1, Math.round(s.download_list_page_size))
+            : DEFAULT_PAGE_SIZE,
+        );
+      })
+      .catch(() => {});
+  }, []);
 
   const refresh = useCallback(() => {
     downloadList()
@@ -96,12 +114,16 @@ export function DownloadsPage() {
     });
   }, [items, labelFilter, keyword]);
 
-  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
   const safePage = Math.min(page, pageCount - 1);
   const visible = useMemo(
-    () => filtered.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE),
-    [filtered, safePage],
+    () => filtered.slice(safePage * pageSize, safePage * pageSize + pageSize),
+    [filtered, safePage, pageSize],
   );
+
+  useEffect(() => {
+    setPage(0);
+  }, [pageSize]);
 
   const run = useCallback((gid: number, p: Promise<unknown>) => {
     setBusy(gid);
@@ -150,7 +172,7 @@ export function DownloadsPage() {
     runBatch(
       selectedGids
         .filter((i) => i.state === "wait" || i.state === "failed" || i.state === "none")
-        .map((i) => () => downloadStart(i.gid, i.token, i.title, i.label, "", "", "", i.total, i.url)),
+        .map((i) => () => downloadStart(i.gid, i.token, i.title, i.label, "", "", "", i.total, i.url, i.thumb)),
     );
   };
   const batchStop = () => {
@@ -202,7 +224,10 @@ export function DownloadsPage() {
         <div className="dl-labels">
           <button
             className={`dl-label ${labelFilter === DEFAULT_LABEL && !keyword ? "active" : ""}`}
-            onClick={() => setLabelFilter(DEFAULT_LABEL)}
+            onClick={() => {
+              setLabelFilter(DEFAULT_LABEL);
+              setPage(0);
+            }}
           >
             {DEFAULT_LABEL}
             <span className="dl-count">
@@ -215,7 +240,10 @@ export function DownloadsPage() {
               <button
                 key={l}
                 className={`dl-label ${labelFilter === l ? "active" : ""}`}
-                onClick={() => setLabelFilter(l)}
+                onClick={() => {
+                  setLabelFilter(l);
+                  setPage(0);
+                }}
               >
                 {l}
                 <span className="dl-count">
@@ -267,13 +295,15 @@ export function DownloadsPage() {
             item={d}
             busy={busy === d.gid || busyAll}
             checked={selected.has(d.gid)}
+            showThumb={showThumb}
             onToggle={() => toggle(d.gid)}
             onStart={() =>
-              run(d.gid, downloadStart(d.gid, d.token, d.title, d.label, "", "", "", d.total, d.url))
+              run(d.gid, downloadStart(d.gid, d.token, d.title, d.label, "", "", "", d.total, d.url, d.thumb))
             }
             onStop={() => run(d.gid, downloadStop(d.gid))}
             onDelete={() => setDeleteFor([d.gid])}
             onRelabel={() => setRelabelFor([d.gid])}
+            onOpen={() => onOpen?.(toGalleryItem(d))}
           />
         ))}
       </div>
@@ -311,20 +341,24 @@ function DownloadRow({
   item,
   busy,
   checked,
+  showThumb,
   onToggle,
   onStart,
   onStop,
   onDelete,
   onRelabel,
+  onOpen,
 }: {
   item: DownloadItem;
   busy: boolean;
   checked: boolean;
+  showThumb: boolean;
   onToggle: () => void;
   onStart: () => void;
   onStop: () => void;
   onDelete: () => void;
   onRelabel: () => void;
+  onOpen: () => void;
 }) {
   const pct = item.total > 0 ? Math.round((item.complete / item.total) * 100) : 0;
   const active = item.state === "downloading";
@@ -334,8 +368,19 @@ function DownloadRow({
       <label className="dl-check">
         <input type="checkbox" checked={checked} onChange={onToggle} />
       </label>
+      {showThumb && (
+        <div className="dl-thumb">
+          {item.thumb ? (
+            <RemoteImg url={item.thumb} alt="" loading="lazy" />
+          ) : (
+            <div className="dl-thumb-placeholder" />
+          )}
+        </div>
+      )}
       <div className="dl-row-main">
-        <div className="dl-row-title" title={item.title}>{item.title}</div>
+        <button type="button" className="dl-row-title" title={item.title} onClick={onOpen}>
+          {item.title}
+        </button>
         <div className={`dl-badge ${active ? "active" : item.state}`}>
           {STATE_TEXT[item.state] ?? item.state}
         </div>
@@ -458,4 +503,22 @@ function RelabelDialog({
       </div>
     </div>
   );
+}
+
+function toGalleryItem(d: DownloadItem): GalleryItem {
+  return {
+    gid: d.gid,
+    token: d.token,
+    title: d.title,
+    thumb: d.thumb || undefined,
+    category: "",
+    posted: "",
+    uploader: "",
+    rating: -1,
+    pages: d.total,
+    thumbWidth: 250,
+    thumbHeight: 350,
+    tags: [],
+    url: d.url || `https://e-hentai.org/g/${d.gid}/${d.token}/`,
+  };
 }

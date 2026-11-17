@@ -59,6 +59,7 @@ export function SettingsPage() {
   const [importResult, setImportResult] = useState<string | null>(null);
   const [tagPath, setTagPath] = useState("");
   const [tagMsg, setTagMsg] = useState<string | null>(null);
+  const [exportSensitive, setExportSensitive] = useState(false);
   const [diag, setDiag] = useState<NetDiag | null>(null);
   const [diagBusy, setDiagBusy] = useState(false);
   const [renameTerms, setRenameTerms] = useState<string[]>([]);
@@ -129,7 +130,7 @@ export function SettingsPage() {
 
   const doExport = async () => {
     try {
-      const json = await exportData();
+      const json = await exportData(exportSensitive);
       const blob = new Blob([json], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -139,7 +140,11 @@ export function SettingsPage() {
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      setFlash("已导出（若未弹出下载，请查收系统下载目录）");
+      setFlash(
+        exportSensitive
+          ? "已导出（包含 Cookie、H@H 凭据和本机路径，请勿分享）"
+          : "已导出安全备份（不含 Cookie、凭据和本机路径）",
+      );
       setErr(null);
     } catch (e) {
       setErr(String(e));
@@ -293,6 +298,7 @@ export function SettingsPage() {
           <SelectSetting label="翻页方向" value={s.reading_direction} options={DIRECTIONS} onChange={(v) => apply("reading_direction", v)} />
           <SelectSetting label="缩放模式" value={s.zoom_mode} options={ZOOMS} onChange={(v) => apply("zoom_mode", v)} />
           <SelectSetting label="起始位置" value={s.reading_start_position} options={STARTS} onChange={(v) => apply("reading_start_position", v)} />
+          <NumberSetting label="纵向预载页数（0–20）" value={s.reading_vertical_preload} onChange={(v) => apply("reading_vertical_preload", Math.max(0, Math.min(20, Math.round(v))))} />
         </div>
       </Section>
 
@@ -300,17 +306,22 @@ export function SettingsPage() {
         <div className="st-grid">
           <TextSetting label="下载目录" value={s.download_dir ?? ""} placeholder="留空使用 图片/EhViewer" onChange={(v) => apply("download_dir", v)} />
           <NumberSetting label="并发线程数（1–10）" value={s.download_threads} onChange={(v) => apply("download_threads", Math.max(1, Math.min(10, v)))} />
-          <NumberSetting label="列表每页条数" value={s.download_list_page_size} onChange={(v) => apply("download_list_page_size", Math.max(1, v))} />
+          <NumberSetting label="下载页每页条数（默认 9）" value={s.download_list_page_size} onChange={(v) => apply("download_list_page_size", Math.max(1, Math.round(v)))} />
           <SwitchSetting label="始终下载原图" checked={s.download_always_original} onChange={(v) => apply("download_always_original", v)} />
+          <SwitchSetting label="下载页显示缩略图" checked={s.download_show_thumb} onChange={(v) => apply("download_show_thumb", v)} />
+          <SwitchSetting label="已完成归档" checked={s.download_archive_completed} onChange={(v) => apply("download_archive_completed", v)} />
           <NumberSetting label="下载间隔（秒）" value={s.download_interval_secs} onChange={(v) => apply("download_interval_secs", Math.max(0, v))} />
           <SwitchSetting label="关闭主界面时最小化到托盘（后台下载）" checked={s.close_to_tray} onChange={(v) => apply("close_to_tray", v)} />
         </div>
+        <p className="st-hint">
+          “已完成归档”会把“默认”标签中的已完成项目移动到“已完成”标签；关闭后不会移回。
+        </p>
       </Section>
 
       <Section title="画廊重命名">
         <p className="st-hint">
           仅处理下方固定扫描目录内的画廊文件夹（含其子目录），把
-          <code> gid-标题 </code> 重命名为 <code>[作者] 作品</code>，并从下载队列移除（磁盘文件保留）；该目录之外一律不改动。
+          <code> gid-标题 </code> 重命名为 <code>[作者] 作品</code>；队列内项目会移出队列，队列外项目仅重命名目录，磁盘文件均保留。该目录之外一律不改动。
         </p>
         <div className="st-grid" style={{ marginTop: 10 }}>
           <TextSetting
@@ -350,6 +361,17 @@ export function SettingsPage() {
       </Section>
 
       <Section title="隐私">
+        <label className="st-field st-switch">
+          <span>导出时包含 Cookie、H@H 凭据、本机路径和浏览历史</span>
+          <input
+            type="checkbox"
+            checked={exportSensitive}
+            onChange={(e) => setExportSensitive(e.target.checked)}
+          />
+        </label>
+        <p className="st-hint">
+          默认关闭。开启后备份可能包含可直接登录的会话凭据和完整画廊历史，只应保存在受信任的本地位置。
+        </p>
         <div className="st-actions">
           <button onClick={doExport}>导出数据</button>
           <label className="st-file">
@@ -490,7 +512,7 @@ function RenamePreviewModal({
         <div className="rn-modal-actions">
           <button onClick={onClose} disabled={busy}>取消</button>
           <button className="danger" onClick={onConfirm} disabled={busy || report.renamed === 0}>
-            {busy ? "处理中…" : "确认重命名并从队列移除"}
+            {busy ? "处理中…" : "确认重命名"}
           </button>
         </div>
       </div>

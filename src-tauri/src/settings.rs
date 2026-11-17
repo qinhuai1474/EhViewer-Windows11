@@ -12,10 +12,18 @@ use crate::client::config::EhConfig;
 
 /// Prefix marking a DPAPI-encrypted cookie value in the JSON file.
 pub const DPAPI_PREFIX: &str = "dpapi:";
+pub const CURRENT_SETTINGS_VERSION: u32 = 2;
+
+fn legacy_settings_version() -> u32 {
+    1
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Internal settings schema version. Old files without this field are v1.
+    #[serde(default = "legacy_settings_version")]
+    pub settings_version: u32,
     /// Gallery site: 0 = E-Hentai, 1 = ExHentai.
     pub site: u8,
     /// The active EH uconfig group.
@@ -37,6 +45,8 @@ pub struct Settings {
     pub zoom_mode: String,
     /// Where the reader starts: first / resume.
     pub reading_start_position: String,
+    /// Vertical reader pages prefetched ahead of the current one (0-20).
+    pub reading_vertical_preload: u32,
 
     // ----- download -----
     /// Download directory override.
@@ -46,6 +56,10 @@ pub struct Settings {
     pub download_always_original: bool,
     /// Downloads page size.
     pub download_list_page_size: u32,
+    /// Show each download cover thumbnail on the Downloads page.
+    pub download_show_thumb: bool,
+    /// Move finished downloads from the default label to the "已完成" label.
+    pub download_archive_completed: bool,
     /// Seconds to wait between consecutive queue downloads (0 = no wait).
     pub download_interval_secs: u64,
     /// User-defined tags stripped when renaming gallery folders. Empty = the
@@ -90,6 +104,7 @@ pub struct CookiePair {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            settings_version: CURRENT_SETTINGS_VERSION,
             site: 0,
             config: EhConfig::default(),
             session_cookies: Vec::new(),
@@ -99,10 +114,13 @@ impl Default for Settings {
             reading_direction: "ltr".into(),
             zoom_mode: "fit_width".into(),
             reading_start_position: "resume".into(),
+            reading_vertical_preload: 20,
             download_dir: None,
             download_threads: 3,
             download_always_original: false,
-            download_list_page_size: 12,
+            download_list_page_size: 9,
+            download_show_thumb: false,
+            download_archive_completed: false,
             download_interval_secs: 5,
             rename_filter_terms: Vec::new(),
             rename_scan_dir: String::new(),
@@ -133,13 +151,44 @@ impl Settings {
         }
         let raw = std::fs::read_to_string(path)?;
         let mut settings: Settings = serde_json::from_str(&raw).unwrap_or_default();
+        let plaintext_cookies = settings.session_cookies.iter().any(|c| {
+            !c.value.is_empty() && !c.value.starts_with(DPAPI_PREFIX)
+        });
         settings.decrypt_cookies();
+        let migrated = settings.apply_migrations();
+        if migrated || plaintext_cookies {
+            // Rewriting legacy plaintext cookies is best-effort during load so a
+            // DPAPI failure does not discard otherwise valid settings. New writes
+            // go through `save`, which fails closed instead of storing plaintext.
+            if let Err(e) = settings.save(path) {
+                log::warn!("failed to secure settings file during load: {e}");
+            }
+        }
         Ok(settings)
+    }
+
+    /// Applies non-destructive schema/default migrations and returns whether the
+    /// settings should be written back. The page-size migration runs only once,
+    /// so deliberately changing it back to 12 later remains respected.
+    pub(crate) fn apply_migrations(&mut self) -> bool {
+        let mut changed = false;
+        if self.settings_version < CURRENT_SETTINGS_VERSION {
+            if self.download_list_page_size == 12 {
+                self.download_list_page_size = 9;
+            }
+            self.settings_version = CURRENT_SETTINGS_VERSION;
+            changed = true;
+        }
+        if self.download_list_page_size == 0 {
+            self.download_list_page_size = 9;
+            changed = true;
+        }
+        changed
     }
 
     pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
         let mut clone = self.clone();
-        clone.encrypt_cookies();
+        clone.encrypt_cookies()?;
         // Never leave encrypted bytes if a cookie is absent or already handled.
         let raw = serde_json::to_string_pretty(&clone)?;
         std::fs::write(path, raw)?;
@@ -147,10 +196,11 @@ impl Settings {
     }
 
     /// Cookies are held plaintext in memory; swizzle to DPAPI for disk writes.
-    fn encrypt_cookies(&mut self) {
+    fn encrypt_cookies(&mut self) -> anyhow::Result<()> {
         for c in &mut self.session_cookies {
-            c.value = encrypt_cookie_value(&c.value);
+            c.value = encrypt_cookie_value(&c.value)?;
         }
+        Ok(())
     }
 
     fn decrypt_cookies(&mut self) {
@@ -161,13 +211,15 @@ impl Settings {
 }
 
 /// Encrypts a cookie value with DPAPI (idempotent for already-encrypted values).
-pub fn encrypt_cookie_value(value: &str) -> String {
+/// Fails closed: a persistence operation must never silently store a plaintext
+/// E-Hentai session credential.
+pub fn encrypt_cookie_value(value: &str) -> anyhow::Result<String> {
     if value.starts_with(DPAPI_PREFIX) {
-        return value.to_string();
+        return Ok(value.to_string());
     }
     match crate::dpapi::protect(value.as_bytes()) {
-        Ok(enc) => format!("{}{}", DPAPI_PREFIX, B64.encode(enc)),
-        Err(_) => value.to_string(), // fall back to plaintext if DPAPI is unavailable
+        Ok(enc) => Ok(format!("{}{}", DPAPI_PREFIX, B64.encode(enc))),
+        Err(e) => anyhow::bail!("Windows DPAPI 加密失败，已拒绝保存明文 Cookie: {e}"),
     }
 }
 
@@ -194,14 +246,16 @@ mod tests {
     fn close_to_tray_defaults_to_enabled() {
         let s = Settings::default();
         assert!(s.close_to_tray, "closing to tray should default to on");
+        assert_eq!(s.download_list_page_size, 9, "download page defaults to 9 items");
+        assert!(!s.download_archive_completed, "auto-archive defaults to off");
     }
 
     #[test]
     fn cookie_encrypt_decrypt_roundtrip() {
         let raw = "ipb_pass_hash=abc123";
-        let enc = encrypt_cookie_value(raw);
+        let enc = encrypt_cookie_value(raw).unwrap();
         // Idempotent: encrypting an already-encrypted value is a no-op.
-        assert_eq!(encrypt_cookie_value(&enc), enc);
+        assert_eq!(encrypt_cookie_value(&enc).unwrap(), enc);
         // Decrypt always restores the original value (DPAPI path or plaintext fallback).
         assert_eq!(decrypt_cookie_value(&enc), raw);
     }
@@ -209,6 +263,26 @@ mod tests {
     #[test]
     fn legacy_plaintext_passes_through() {
         assert_eq!(decrypt_cookie_value("plain"), "plain");
+    }
+
+    #[test]
+    fn legacy_plaintext_cookie_is_rewritten_with_dpapi_on_load() {
+        let dir = std::env::temp_dir().join(format!("ehv-set-cookie-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"session_cookies":[{"name":"ipb_pass_hash","value":"legacy-secret"}]}"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load(&path).unwrap();
+        assert_eq!(loaded.session_cookies[0].value, "legacy-secret");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains(DPAPI_PREFIX));
+        assert!(!on_disk.contains("legacy-secret"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -227,6 +301,30 @@ mod tests {
         assert_eq!(loaded.session_cookies[0].value, "xyz");
         assert_eq!(loaded.download_threads, 7);
         assert!(loaded.download_always_original);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_page_size_migrates_once() {
+        let dir = std::env::temp_dir().join(format!("ehv-set-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"download_list_page_size":12,"download_threads":5}"#,
+        )
+        .unwrap();
+
+        let migrated = Settings::load(&path).unwrap();
+        assert_eq!(migrated.download_list_page_size, 9);
+        assert_eq!(migrated.settings_version, CURRENT_SETTINGS_VERSION);
+
+        let mut edited = migrated;
+        edited.download_list_page_size = 12;
+        edited.save(&path).unwrap();
+        let reloaded = Settings::load(&path).unwrap();
+        assert_eq!(reloaded.download_list_page_size, 12, "migration must only run once");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

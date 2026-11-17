@@ -190,9 +190,10 @@ async fn download_start(
     group: String,
     total: u32,
     url: String,
+    thumb: String,
 ) -> Result<(), String> {
     let m = app.state::<Arc<DownloadManager>>();
-    m.start_download(gid, token, title, label, artist, language, group, total, url)
+    m.start_download(gid, token, title, label, artist, language, group, total, url, thumb)
         .await
 }
 
@@ -224,10 +225,9 @@ async fn download_list(app: tauri::AppHandle) -> Result<Vec<db::DownloadDto>, St
     m.list_downloads()
 }
 
-/// Recursively renames downloaded gallery folders to `[Author] Title` and removes
-/// them from the download queue. `preview = true` only builds the before/after
-/// plan in memory (no filesystem or database writes) so the UI can confirm or
-/// cancel without side effects.
+/// Recursively renames marked gallery folders to `[Author] Title`. Queued items
+/// are removed from the download queue after success; off-queue items are renamed
+/// in place. `preview = true` only builds the before/after plan in memory.
 #[tauri::command]
 async fn rename_download_dirs(
     app: tauri::AppHandle,
@@ -269,6 +269,8 @@ fn settings_set(
     key: String,
     value: serde_json::Value,
 ) -> Result<settings::Settings, String> {
+    let archive_requested = key == "download_archive_completed"
+        && value.as_bool() == Some(true);
     let state = app.state::<AppState>();
     let snapshot = {
         let mut guard = state.settings.lock().unwrap();
@@ -283,6 +285,14 @@ fn settings_set(
         snap
     };
     let _ = app.emit(EV_SETTINGS_CHANGED, ());
+    if archive_requested {
+        let manager = app.state::<Arc<DownloadManager>>().inner().clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = manager.archive_completed_defaults().await {
+                log::warn!("failed to archive existing completed downloads: {}", e);
+            }
+        });
+    }
     Ok(snapshot)
 }
 
@@ -327,17 +337,71 @@ async fn cookie_verify(app: tauri::AppHandle, site: u8) -> Result<serde_json::Va
     }
 }
 
-/// Exports settings + downloads + reading progress as a JSON bundle.
+fn settings_for_export(source: &settings::Settings, include_sensitive: bool) -> settings::Settings {
+    let mut out = source.clone();
+    if !include_sensitive {
+        out.session_cookies.clear();
+        out.config.hah_client_ip.clear();
+        out.config.hah_client_port = -1;
+        out.config.hah_client_passkey.clear();
+        out.download_dir = None;
+        out.rename_scan_dir.clear();
+        out.tag_translation_file = None;
+        out.proxy_url = None;
+        out.hosts_override.clear();
+        out.custom_host = None;
+        out.image_host_allowlist.clear();
+        out.doh_url.clear();
+    }
+    out
+}
+
+fn preserve_local_secrets(target: &mut settings::Settings, current: &settings::Settings) {
+    target.session_cookies = current.session_cookies.clone();
+    target.config.hah_client_ip = current.config.hah_client_ip.clone();
+    target.config.hah_client_port = current.config.hah_client_port;
+    target.config.hah_client_passkey = current.config.hah_client_passkey.clone();
+    target.download_dir = current.download_dir.clone();
+    target.rename_scan_dir = current.rename_scan_dir.clone();
+    target.tag_translation_file = current.tag_translation_file.clone();
+    target.proxy_url = current.proxy_url.clone();
+    target.hosts_override = current.hosts_override.clone();
+    target.custom_host = current.custom_host.clone();
+    target.image_host_allowlist = current.image_host_allowlist.clone();
+    target.doh_url = current.doh_url.clone();
+}
+
+/// Exports settings + downloads + reading progress as a portable JSON bundle.
+/// Credentials and machine-local paths are omitted unless explicitly requested.
 #[tauri::command]
-fn export_data(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+fn export_data(
+    app: tauri::AppHandle,
+    include_sensitive: bool,
+) -> Result<serde_json::Value, String> {
     let state = app.state::<AppState>();
-    let settings = state.settings.lock().unwrap().clone();
-    let downloads = state.db.list_downloads().map_err(|e| e.to_string())?;
-    let reading = state.db.all_reading_progress().map_err(|e| e.to_string())?;
+    let settings = settings_for_export(
+        &state.settings.lock().unwrap().clone(),
+        include_sensitive,
+    );
+    let (downloads, reading) = if include_sensitive {
+        (
+            state
+                .db
+                .list_downloads()
+                .map_err(|e| e.to_string())?
+                .iter()
+                .map(db::DownloadDto::from)
+                .collect::<Vec<_>>(),
+            state.db.all_reading_progress().map_err(|e| e.to_string())?,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     Ok(serde_json::json!({
-        "version": 1,
+        "version": 2,
+        "contains_sensitive_data": include_sensitive,
         "settings": settings,
-        "downloads": downloads.iter().map(db::DownloadDto::from).collect::<Vec<_>>(),
+        "downloads": downloads,
         "reading_progress": reading
             .iter()
             .map(|(g, p)| serde_json::json!({ "gid": g, "page": p }))
@@ -372,30 +436,44 @@ fn import_data(
     let state = app.state::<AppState>();
     let mut imported_downloads = 0usize;
     let mut imported_progress = 0usize;
+    let contains_sensitive_data = payload
+        .get("contains_sensitive_data")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
-    if let Some(dls) = payload.get("downloads").and_then(|v| v.as_array()) {
-        let recs = dls.iter().filter_map(record_from_json).collect::<Vec<db::DownloadRecord>>();
-        state.db.clear_downloads().map_err(|e| e.to_string())?;
-        for r in &recs {
-            state.db.upsert_download(r).map_err(|e| e.to_string())?;
+    if contains_sensitive_data {
+        if let Some(dls) = payload.get("downloads").and_then(|v| v.as_array()) {
+            let recs = dls
+                .iter()
+                .filter_map(record_from_json)
+                .collect::<Vec<db::DownloadRecord>>();
+            state.db.clear_downloads().map_err(|e| e.to_string())?;
+            for r in &recs {
+                state.db.upsert_download(r).map_err(|e| e.to_string())?;
+            }
+            imported_downloads = recs.len();
         }
-        imported_downloads = recs.len();
-    }
-    if let Some(ps) = payload.get("reading_progress").and_then(|v| v.as_array()) {
-        for p in ps {
-            let gid = p.get("gid").and_then(|v| v.as_u64()).unwrap_or(0);
-            let page = p.get("page").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
-            if gid != 0 {
-                state
-                    .db
-                    .save_reading_progress(gid, page)
-                    .map_err(|e| e.to_string())?;
-                imported_progress += 1;
+        if let Some(ps) = payload.get("reading_progress").and_then(|v| v.as_array()) {
+            for p in ps {
+                let gid = p.get("gid").and_then(|v| v.as_u64()).unwrap_or(0);
+                let page = p.get("page").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                if gid != 0 {
+                    state
+                        .db
+                        .save_reading_progress(gid, page)
+                        .map_err(|e| e.to_string())?;
+                    imported_progress += 1;
+                }
             }
         }
     }
     if let Some(s) = payload.get("settings") {
-        if let Ok(imported) = serde_json::from_value::<settings::Settings>(s.clone()) {
+        if let Ok(mut imported) = serde_json::from_value::<settings::Settings>(s.clone()) {
+            imported.apply_migrations();
+            if !contains_sensitive_data {
+                let current = state.settings.lock().unwrap().clone();
+                preserve_local_secrets(&mut imported, &current);
+            }
             let mut guard = state.settings.lock().unwrap();
             *guard = imported;
             guard.save(&state.settings_path).map_err(|e| e.to_string())?;
@@ -408,6 +486,14 @@ fn import_data(
         }
     }
     let _ = app.emit(EV_SETTINGS_CHANGED, ());
+    if state.settings.lock().unwrap().download_archive_completed {
+        let manager = app.state::<Arc<DownloadManager>>().inner().clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = manager.archive_completed_defaults().await {
+                log::warn!("failed to archive completed downloads after import: {}", e);
+            }
+        });
+    }
     Ok(serde_json::json!({
         "imported_downloads": imported_downloads,
         "imported_progress": imported_progress,
@@ -426,10 +512,17 @@ fn set_setting_field(s: &mut settings::Settings, key: &str, value: &serde_json::
         "reading_direction" => s.reading_direction = str_v.unwrap_or_else(|| s.reading_direction.clone()),
         "zoom_mode" => s.zoom_mode = str_v.unwrap_or_else(|| s.zoom_mode.clone()),
         "reading_start_position" => s.reading_start_position = str_v.unwrap_or_else(|| s.reading_start_position.clone()),
+        "reading_vertical_preload" => s.reading_vertical_preload = (value.as_u64().unwrap_or(20) as u32).min(20),
         "download_dir" => s.download_dir = some_str,
         "download_threads" => s.download_threads = value.as_u64().unwrap_or(1) as u32,
         "download_always_original" => s.download_always_original = value.as_bool().unwrap_or(false),
-        "download_list_page_size" => s.download_list_page_size = value.as_u64().unwrap_or(12) as u32,
+        "download_list_page_size" => {
+            s.download_list_page_size = value.as_u64().unwrap_or(9).max(1) as u32
+        }
+        "download_show_thumb" => s.download_show_thumb = value.as_bool().unwrap_or(false),
+        "download_archive_completed" => {
+            s.download_archive_completed = value.as_bool().unwrap_or(false)
+        }
         "download_interval_secs" => s.download_interval_secs = value.as_u64().unwrap_or(5) as u64,
         "rename_filter_terms" => {
             s.rename_filter_terms = value
@@ -476,6 +569,7 @@ fn record_from_json(v: &serde_json::Value) -> Option<db::DownloadRecord> {
         complete: v.get("complete").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
         dir: v.get("dir").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         url: v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        thumb: v.get("thumb").and_then(|x| x.as_str()).unwrap_or("").to_string(),
     })
 }
 
@@ -711,5 +805,65 @@ mod tests {
         assert_eq!(state_from_json(Some(&serde_json::json!(3))), 3);
         assert_eq!(state_from_json(Some(&serde_json::json!("failed"))), 4);
         assert_eq!(state_from_json(None), 0);
+    }
+
+    #[test]
+    fn download_page_and_archive_settings_are_wired() {
+        let mut s = settings::Settings::default();
+        set_setting_field(&mut s, "download_list_page_size", &serde_json::json!(0)).unwrap();
+        assert_eq!(s.download_list_page_size, 1);
+        set_setting_field(
+            &mut s,
+            "download_archive_completed",
+            &serde_json::json!(true),
+        )
+        .unwrap();
+        assert!(s.download_archive_completed);
+    }
+
+    #[test]
+    fn portable_export_redacts_credentials_and_local_paths() {
+        let mut source = settings::Settings::default();
+        source.session_cookies.push(settings::CookiePair {
+            name: "ipb_pass_hash".into(),
+            value: "secret".into(),
+        });
+        source.config.hah_client_ip = "10.0.0.2".into();
+        source.config.hah_client_port = 1234;
+        source.config.hah_client_passkey = "hah-secret".into();
+        source.download_dir = Some(r"C:\private\downloads".into());
+        source.rename_scan_dir = r"C:\private\rename".into();
+        source.proxy_url = Some("user:pass@proxy.example:8080".into());
+
+        let safe = settings_for_export(&source, false);
+        assert!(safe.session_cookies.is_empty());
+        assert!(safe.config.hah_client_ip.is_empty());
+        assert_eq!(safe.config.hah_client_port, -1);
+        assert!(safe.config.hah_client_passkey.is_empty());
+        assert!(safe.download_dir.is_none());
+        assert!(safe.rename_scan_dir.is_empty());
+        assert!(safe.proxy_url.is_none());
+
+        let full = settings_for_export(&source, true);
+        assert_eq!(full.session_cookies[0].value, "secret");
+        assert_eq!(full.proxy_url.as_deref(), Some("user:pass@proxy.example:8080"));
+    }
+
+    #[test]
+    fn portable_import_preserves_current_local_secrets() {
+        let mut current = settings::Settings::default();
+        current.session_cookies.push(settings::CookiePair {
+            name: "ipb_member_id".into(),
+            value: "current".into(),
+        });
+        current.download_dir = Some(r"C:\current".into());
+        current.config.hah_client_passkey = "local".into();
+
+        let mut imported = settings::Settings::default();
+        imported.session_cookies.clear();
+        preserve_local_secrets(&mut imported, &current);
+        assert_eq!(imported.session_cookies[0].value, "current");
+        assert_eq!(imported.download_dir.as_deref(), Some(r"C:\current"));
+        assert_eq!(imported.config.hah_client_passkey, "local");
     }
 }
